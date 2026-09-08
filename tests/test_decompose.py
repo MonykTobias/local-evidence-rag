@@ -8,6 +8,8 @@ opinion is missing, wrong, or hostile.
 
 from __future__ import annotations
 
+import os
+
 from fake_ollama import FakeSession, reply
 
 from claim_evidence import Settings
@@ -27,7 +29,7 @@ from claim_evidence.errors import (
     UnsupportedClaimError,
     ValidationError,
 )
-from claim_evidence.ollama import OllamaClient
+from claim_evidence.ollama import THINK_ENV, OllamaClient
 
 ENTITY = "IKEA"
 POST = (
@@ -84,6 +86,21 @@ def schemas_asked(session: FakeSession) -> list[str]:
         for url, payload in session.requests
         if url.endswith("/api/chat")
     ]
+
+
+def test_thinking_can_be_disabled() -> None:
+    saved = os.environ.get(THINK_ENV)
+    try:
+        os.environ[THINK_ENV] = "false"
+        ollama, session = client(["IKEA cut water use by 10%"])
+        decompose_claims(ollama, POST, reporting_entity=ENTITY)
+    finally:
+        if saved is None:
+            os.environ.pop(THINK_ENV, None)
+        else:
+            os.environ[THINK_ENV] = saved
+    chat_payload = next(payload for url, payload in session.requests if url.endswith("/api/chat"))
+    check(chat_payload["think"] is False, "the environment switch sends think=false")
 
 
 # --- deterministic grounding ------------------------------------------------

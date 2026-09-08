@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 from typing import Any, Iterable, Sequence, TypeVar
 
 import requests
@@ -18,6 +19,7 @@ from pydantic import BaseModel, ValidationError
 from .config import Settings
 
 T = TypeVar("T", bound=BaseModel)
+THINK_ENV = "CLAIM_EVIDENCE_OLLAMA_THINK"
 
 
 class OllamaError(RuntimeError):
@@ -41,6 +43,19 @@ def gbnf_safe_schema(schema: type[BaseModel]) -> dict[str, Any]:
         return node
 
     return prune(schema.model_json_schema())
+
+
+def request_think() -> bool | None:
+    """Optional Ollama thinking override; unset preserves the model default."""
+    raw = os.getenv(THINK_ENV)
+    if raw is None:
+        return None
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{THINK_ENV} must be true or false")
 
 
 class OllamaClient:
@@ -164,6 +179,9 @@ class OllamaClient:
             # option, and passing one would be noise at best.
             "options": {"temperature": 0, "num_ctx": self.settings.num_ctx},
         }
+        think = request_think()
+        if think is not None:
+            payload["think"] = think
 
         last_error: Exception | None = None
         for attempt in range(2):
