@@ -9,6 +9,8 @@ is indifferent to that difference.
 
 from __future__ import annotations
 
+import hashlib
+import logging
 import re
 from typing import Any, Sequence
 
@@ -32,6 +34,8 @@ from .models import (
 )
 from .normalize import all_years, content_tokens, normalize_for_match, scope_markers
 from .progress import ProgressReporter
+
+logger = logging.getLogger(__name__)
 
 RRF_K = 60
 # Scaled to the fusion signal, not to 1.0: a candidate ranked first by all
@@ -176,12 +180,41 @@ def retrieve(
     """
     report = reporter or ProgressReporter(None, "audit")
     ranked: dict[str, list[dict[str, Any]]] = {}
+    retrieval_pass = "mapped_context" if allowed_kinds else "direct"
+    lexical = lexical_query(claim_text, claim.key_terms)
+    metric_terms = sorted(content_tokens(claim.metric or claim_text))[:8]
+    common = {
+        "operation": report.operation, "audit_id": report.audit_id,
+        "document_id": report.document_id, "retrieval_pass": retrieval_pass,
+    }
+    logger.info(
+        "retrieval started",
+        extra={
+            "event": "retrieval_started", **common,
+            "document_ids": list(document_ids or ()), "limit": limit, "pool": pool,
+            "vector_enabled": query_embedding is not None,
+        },
+    )
+    logger.debug(
+        "retrieval queries prepared",
+        extra={
+            "event": "retrieval_queries", **common,
+            "graph_term_count": len(metric_terms),
+            "lexical_query_chars": len(lexical),
+            "lexical_query_sha256": hashlib.sha256(
+                lexical.encode("utf-8")
+            ).hexdigest(),
+            "exact_query_tokens": sorted(exact_tokens(claim, claim_text)),
+            "reporting_period": claim.reporting_period,
+            "baseline_period": claim.baseline_period,
+        },
+    )
 
     report.start("retrieving_graph", "Searching claim facts", total=pool)
     ranked["graph"] = _admitted(
         graph_search(
             conn,
-            metric_terms=sorted(content_tokens(claim.metric or claim_text))[:8],
+            metric_terms=metric_terms,
             reporting_period=claim.reporting_period,
             baseline_period=claim.baseline_period,
             document_ids=document_ids,
@@ -199,7 +232,7 @@ def retrieve(
     report.start("retrieving_full_text", "Searching full text", total=pool)
     ranked["lexical"] = _admitted(
         lexical_search(
-            conn, lexical_query(claim_text, claim.key_terms), document_ids, pool
+            conn, lexical, document_ids, pool
         ),
         allowed_kinds,
     )
@@ -222,6 +255,23 @@ def retrieve(
             total=pool,
         )
 
+    logger.debug(
+        "retrieval stages produced candidates",
+        extra={
+            "event": "retrieval_stage_candidates", **common,
+            "candidates_by_stage": {
+                stage: [
+                    {
+                        "evidence_id": int(row["id"]), "rank": rank,
+                        "score": row.get(f"{stage}_score"),
+                    }
+                    for rank, row in enumerate(rows, start=1)
+                ]
+                for stage, rows in ranked.items()
+            },
+        },
+    )
+
     report.start("fusing_candidates", "Merging candidate ranks")
     fused = fuse(ranked, claim=claim, claim_text=claim_text)
     # completed == total: every merged candidate was processed. The limit that
@@ -232,7 +282,41 @@ def retrieve(
         completed=len(fused),
         total=len(fused),
     )
-    return fused[:limit], ranked
+    kept = fused[:limit]
+    for entry in kept:
+        logger.debug(
+            "candidate retained after fusion",
+            extra={
+                "event": "candidate_fused", **common,
+                "evidence_id": int(entry["row"]["id"]),
+                "combined_rank": entry.get("combined_rank"),
+                "combined_score": entry.get("score"),
+                "graph_rank": entry.get("graph_rank"),
+                "graph_score": entry.get("graph_score"),
+                "lexical_rank": entry.get("lexical_rank"),
+                "lexical_score": entry.get("lexical_score"),
+                "vector_rank": entry.get("vector_rank"),
+                "vector_score": entry.get("vector_score"),
+            },
+        )
+    logger.info(
+        "retrieval completed",
+        extra={
+            "event": "retrieval_completed", **common,
+            "graph_candidates": len(ranked.get("graph", ())),
+            "lexical_candidates": len(ranked.get("lexical", ())),
+            "vector_candidates": len(ranked.get("vector", ())),
+            "fused_candidates": len(fused), "retained_candidates": len(kept),
+        },
+    )
+    logger.debug(
+        "retrieval candidates left after limit",
+        extra={
+            "event": "retrieval_candidates_dropped", **common,
+            "evidence_ids": [int(entry["row"]["id"]) for entry in fused[limit:]],
+        },
+    )
+    return kept, ranked
 
 
 def expand(
@@ -248,6 +332,14 @@ def expand(
     """
     report = reporter or ProgressReporter(None, "audit")
     considered = min(top, len(candidates))
+    logger.debug(
+        "context expansion started",
+        extra={
+            "event": "context_expansion_started", "operation": report.operation,
+            "audit_id": report.audit_id, "document_id": report.document_id,
+            "input_candidates": len(candidates), "seeds": considered,
+        },
+    )
     report.start("expanding_context", "Expanding context", total=considered)
     seen = {int(c["row"]["id"]) for c in candidates}
     extra: list[dict[str, Any]] = []
@@ -268,6 +360,16 @@ def expand(
                     "expanded_from": int(candidate["row"]["id"]),
                 }
             )
+            logger.debug(
+                "candidate entered through context expansion",
+                extra={
+                    "event": "candidate_expanded", "operation": report.operation,
+                    "audit_id": report.audit_id, "document_id": report.document_id,
+                    "evidence_id": evidence_id,
+                    "expanded_from": int(candidate["row"]["id"]),
+                    "combined_score": candidate["score"] * 0.25,
+                },
+            )
         report.step(
             "expanding_context",
             f"Expanded {position} of {considered}",
@@ -280,7 +382,17 @@ def expand(
         completed=considered,
         total=considered,
     )
-    return [*candidates, *extra]
+    expanded = [*candidates, *extra]
+    logger.info(
+        "context expansion completed",
+        extra={
+            "event": "context_expansion_completed", "operation": report.operation,
+            "audit_id": report.audit_id, "document_id": report.document_id,
+            "input_candidates": len(candidates), "added_candidates": len(extra),
+            "output_candidates": len(expanded),
+        },
+    )
+    return expanded
 
 
 def to_citation(

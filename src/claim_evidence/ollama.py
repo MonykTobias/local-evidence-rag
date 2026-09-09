@@ -10,13 +10,17 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
+import time
 from typing import Any, Iterable, Sequence, TypeVar
 
 import requests
 from pydantic import BaseModel, ValidationError
 
 from .config import Settings
+
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
 THINK_ENV = "CLAIM_EVIDENCE_OLLAMA_THINK"
@@ -67,18 +71,51 @@ class OllamaClient:
 
     def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         url = f"{self.settings.ollama_base_url}{path}"
+        started = time.monotonic()
+        logger.debug(
+            "model request started",
+            extra={
+                "event": "model_request_started", "endpoint": path,
+                "model": payload.get("model"),
+            },
+        )
         try:
             response = self.session.post(
                 url, json=payload, timeout=self.settings.request_timeout
             )
             response.raise_for_status()
-            return response.json()
+            result = response.json()
+            logger.debug(
+                "model request completed",
+                extra={
+                    "event": "model_request_completed", "endpoint": path,
+                    "model": payload.get("model"),
+                    "duration_seconds": round(time.monotonic() - started, 3),
+                },
+            )
+            return result
         except requests.RequestException as exc:
             # Ollama explains a rejected request in the body; without it a 400
             # is indistinguishable from a network failure.
             detail = getattr(getattr(exc, "response", None), "text", "") or ""
+            logger.error(
+                "model request failed",
+                extra={
+                    "event": "model_request_failed", "endpoint": path,
+                    "model": payload.get("model"), "error_type": type(exc).__name__,
+                    "duration_seconds": round(time.monotonic() - started, 3),
+                },
+            )
             raise OllamaError(f"{url} failed: {exc}{f' -- {detail[:400]}' if detail else ''}") from exc
         except json.JSONDecodeError as exc:
+            logger.error(
+                "model returned non-JSON",
+                extra={
+                    "event": "model_response_non_json", "endpoint": path,
+                    "model": payload.get("model"),
+                    "duration_seconds": round(time.monotonic() - started, 3),
+                },
+            )
             raise OllamaError(f"{url} returned non-JSON: {exc}") from exc
 
     # --- model identity -----------------------------------------------------
@@ -188,9 +225,28 @@ class OllamaClient:
             data = self._post("/api/chat", payload)
             content = (data.get("message") or {}).get("content") or ""
             try:
-                return schema.model_validate_json(content)
+                result = schema.model_validate_json(content)
+                logger.debug(
+                    "structured response validated",
+                    extra={
+                        "event": "structured_response_validated",
+                        "schema": schema.__name__, "model": payload["model"],
+                        "attempt": attempt + 1,
+                    },
+                )
+                return result
             except (ValidationError, ValueError) as exc:
                 last_error = exc
+                logger.warning(
+                    "structured response failed validation; retrying"
+                    if attempt == 0 else
+                    "structured response failed validation after retry",
+                    extra={
+                        "event": "structured_response_invalid",
+                        "schema": schema.__name__, "model": payload["model"],
+                        "attempt": attempt + 1, "error_type": type(exc).__name__,
+                    },
+                )
                 # One retry with the failure echoed back; a second miss is an
                 # explicit error, never a guessed answer.
                 payload["messages"] = [

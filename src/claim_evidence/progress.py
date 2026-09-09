@@ -10,6 +10,7 @@ disabled for the rest of the operation and the work continues.
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Callable
 from typing import Any
@@ -21,6 +22,8 @@ from .errors import (
     ValidationError,
 )
 from .models import ProgressEvent
+
+logger = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[ProgressEvent], None]
 
@@ -139,6 +142,16 @@ class ProgressReporter:
             self.phase = phase
         elif status == "completed":
             self._close_phase(phase)
+        logger.debug(
+            "operation phase",
+            extra={
+                "event": "operation_phase", "operation": self.operation,
+                "phase": phase, "status": status,
+                "document_id": self.document_id, "audit_id": self.audit_id,
+                "completed": completed, "total": total,
+                "elapsed_seconds": self.elapsed_seconds,
+            },
+        )
         if not self.active:
             return
         event = ProgressEvent(
@@ -159,6 +172,14 @@ class ProgressReporter:
             # A UI that crashes is a UI problem. Stop talking to it and let the
             # index build finish.
             self.broken = True
+            logger.warning(
+                "progress callback disabled after failure",
+                extra={
+                    "event": "progress_callback_failed", "operation": self.operation,
+                    "phase": phase, "document_id": self.document_id,
+                    "audit_id": self.audit_id,
+                },
+            )
 
     # --- convenience wrappers over the one emit path ------------------------
 
@@ -208,6 +229,16 @@ class ProgressReporter:
         """Emit one safe terminal event. The caller re-raises afterwards."""
         failed_phase = phase or self.phase or "unknown"
         code, retryable, message = classify_error(exc)
+        logger.error(
+            "operation failed",
+            extra={
+                "event": "operation_failed", "operation": self.operation,
+                "phase": failed_phase, "document_id": self.document_id,
+                "audit_id": self.audit_id, "error_type": type(exc).__name__,
+                "error_code": code, "retryable": retryable,
+                "elapsed_seconds": self.elapsed_seconds,
+            },
+        )
         self.emit(
             failed_phase,
             "failed",

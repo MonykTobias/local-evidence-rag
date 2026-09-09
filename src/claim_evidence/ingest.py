@@ -14,9 +14,6 @@ from pathlib import Path
 from typing import Any, Sequence
 
 import psycopg
-
-log = logging.getLogger(__name__)
-
 from document_extract.contracts import PAGE_ARTIFACT_ROLES
 
 from .config import Settings
@@ -73,6 +70,8 @@ from .errors import (
 )
 from .ollama import OllamaClient, OllamaError
 from .source import OutputReader, canonical_digest, page_units, sha256_file
+
+logger = logging.getLogger(__name__)
 
 # Table values are reached through their row, their fact, and lexical search.
 # Embedding 11k near-identical "(40.2) %" strings buys nothing semantically and
@@ -296,6 +295,14 @@ def ingest_document(
             " attributed to it, and a document's filename is not an entity"
         )
     reporter = ProgressReporter(progress, "ingest")
+    logger.info(
+        "ingestion started",
+        extra={
+            "event": "ingestion_started", "operation": "ingest",
+            "document_id": None, "force": force,
+            "extract_narrative_facts": extract_narrative_facts,
+        },
+    )
     # Set once a version exists, so a failure before that point has nothing to
     # mark and a failure after it marks exactly one row.
     building: list[int] = []
@@ -337,7 +344,13 @@ def _record_failure(
         conn.rollback()
         mark_version_failed(conn, version_id, code, phase or "unknown")
     except Exception:  # noqa: BLE001 - never mask the original failure
-        log.exception("could not record the failure of version %s", version_id)
+        logger.error(
+            "could not persist ingestion failure",
+            extra={
+                "event": "ingestion_failure_persistence_failed",
+                "version_id": version_id, "error_type": "database_error",
+            },
+        )
 
 
 def _ingest(
@@ -389,6 +402,13 @@ def _ingest(
         identity_key(reader.root, source_sha256, source_uri),
     )
     reporter.document_id = document_id
+    logger.info(
+        "document resolved for ingestion",
+        extra={
+            "event": "ingestion_document_resolved", "operation": "ingest",
+            "document_id": document_id, "page_count": len(pages),
+        },
+    )
     existing = find_version(conn, document_id, fingerprint)
     # Reuse requires an exact fingerprint *and* a queryable state. A degraded
     # version qualifies -- rebuilding it from scratch would re-derive identical
@@ -419,6 +439,17 @@ def _ingest(
             total=1,
             details=_completion_details(report, reporter),
         )
+        logger.info(
+            "ingestion completed using existing version",
+            extra={
+                "event": "ingestion_completed", "operation": "ingest",
+                "document_id": document_id, "version_id": version_id,
+                "status": str(report.status), "reused_existing": True,
+                "page_count": report.pages, "evidence_count": report.evidence_units,
+                "fact_count": report.facts,
+                "duration_seconds": reporter.elapsed_seconds,
+            },
+        )
         return report
 
     version_id = start_version(
@@ -432,6 +463,13 @@ def _ingest(
         force=force,
     )
     building.append(version_id)
+    logger.info(
+        "document version opened",
+        extra={
+            "event": "ingestion_version_started", "operation": "ingest",
+            "document_id": document_id, "version_id": version_id, "force": force,
+        },
+    )
 
     # The reporting entity is stated by the caller, not derived from the
     # document's basename. `organization_name("danoneurdaccessible.pdf")` made a
@@ -550,6 +588,18 @@ def _ingest(
         total=1,
         details=_completion_details(report, reporter),
     )
+    logger.info(
+        "ingestion completed",
+        extra={
+            "event": "ingestion_completed", "operation": "ingest",
+            "document_id": document_id, "version_id": version_id,
+            "status": str(report.status), "reused_existing": False,
+            "page_count": report.pages, "evidence_count": report.evidence_units,
+            "embedded_count": report.embedded_units, "fact_count": report.facts,
+            "warning_count": len(report.warnings),
+            "duration_seconds": reporter.elapsed_seconds,
+        },
+    )
     return report
 
 
@@ -576,8 +626,16 @@ def _warn_new(
     reporter: ProgressReporter, phase: str, reader: OutputReader, already: int
 ) -> int:
     """Surface recoverable fallbacks the reader recorded, once each."""
-    for warning in reader.warnings[already:]:
+    for index, warning in enumerate(reader.warnings[already:], start=already + 1):
         reporter.warn(phase, warning)
+        logger.warning(
+            "source artifact required a recoverable fallback",
+            extra={
+                "event": "source_warning", "operation": "ingest",
+                "document_id": reporter.document_id, "phase": phase,
+                "warning_index": index,
+            },
+        )
     return len(reader.warnings)
 
 
@@ -619,6 +677,14 @@ def _embed_pending(
     size = max(1, settings.embed_batch_size)
     batches = -(-len(pending) // size)  # ceil, and 0 when nothing is pending
     reporter.start("embedding_evidence", "Embedding evidence", total=batches)
+    logger.info(
+        "evidence embedding started",
+        extra={
+            "event": "embedding_started", "operation": "ingest",
+            "document_id": reporter.document_id, "version_id": version_id,
+            "pending_units": len(pending), "batch_count": batches,
+        },
+    )
     for number, start in enumerate(range(0, len(pending), size), start=1):
         chunk = pending[start : start + size]
         vectors = client.embed([row["normalized_text"] or " " for row in chunk])
@@ -638,6 +704,15 @@ def _embed_pending(
         f"Embedded {embedded} evidence units",
         completed=batches,
         total=batches,
+    )
+    logger.info(
+        "evidence embedding completed",
+        extra={
+            "event": "embedding_completed", "operation": "ingest",
+            "document_id": reporter.document_id, "version_id": version_id,
+            "embedded_units": embedded, "batch_count": batches,
+            "duration_seconds": reporter.durations().get("embedding_evidence"),
+        },
     )
     return embedded
 
@@ -673,6 +748,15 @@ def _build_facts(
         else []
     )
     reporter.start("extracting_facts", "Extracting facts", total=len(candidates))
+    logger.info(
+        "fact extraction started",
+        extra={
+            "event": "fact_extraction_started", "operation": "ingest",
+            "document_id": reporter.document_id, "version_id": version_id,
+            "candidate_count": len(candidates),
+            "narrative_enabled": extract_narrative_facts,
+        },
+    )
 
     for fact in table_facts(units, subject):
         stored += _store_fact(conn, version_id, fact, subject_entity, evidence_ids)
@@ -685,6 +769,16 @@ def _build_facts(
             completed=0,
             total=0,
         )
+        logger.info(
+            "fact extraction completed",
+            extra={
+                "event": "fact_extraction_completed", "operation": "ingest",
+                "document_id": reporter.document_id, "version_id": version_id,
+                "candidate_count": 0, "successful_candidates": 0,
+                "stored_facts": stored, "rejected_facts": 0,
+                "duration_seconds": reporter.durations().get("extracting_facts"),
+            },
+        )
         return stored, rejected
 
     succeeded = 0
@@ -695,7 +789,7 @@ def _build_facts(
                 FACT_EXTRACTION_SYSTEM,
                 fact_extraction_prompt(unit, subject),
             )
-        except OllamaError:
+        except OllamaError as exc:
             # One passage the model could not process is not a failed index --
             # but it is not a silent success either. The key and a category are
             # recorded so a retry can process exactly this candidate again; the
@@ -705,6 +799,15 @@ def _build_facts(
             reader.warnings.append(f"fact extraction failed for {unit.unit_key}")
             reporter.warn(
                 "extracting_facts", "A passage could not be processed by the model"
+            )
+            logger.warning(
+                "fact extraction deferred after model failure",
+                extra={
+                    "event": "fact_extraction_fallback", "operation": "ingest",
+                    "document_id": reporter.document_id, "version_id": version_id,
+                    "evidence_id": evidence_ids.get(unit.unit_key),
+                    "unit_key": unit.unit_key, "error_type": type(exc).__name__,
+                },
             )
             continue
         kept, dropped = accept_llm_facts(extraction.facts, unit, subject)
@@ -731,6 +834,16 @@ def _build_facts(
         completed=len(candidates),
         total=len(candidates),
     )
+    logger.info(
+        "fact extraction completed",
+        extra={
+            "event": "fact_extraction_completed", "operation": "ingest",
+            "document_id": reporter.document_id, "version_id": version_id,
+            "candidate_count": len(candidates), "successful_candidates": succeeded,
+            "stored_facts": stored, "rejected_facts": len(rejected),
+            "duration_seconds": reporter.durations().get("extracting_facts"),
+        },
+    )
     return stored, rejected
 
 
@@ -747,13 +860,27 @@ def _store_fact(
     metric_entity = upsert_entity(
         conn, "metric", fact.metric, normalized_name(fact.metric)
     )
-    upsert_fact(
+    fact_id = upsert_fact(
         conn,
         version_id,
         fact,
         normalize_for_match(fact.metric),
         subject_entity,
         ids,
+    )
+    logger.debug(
+        "fact stored",
+        extra={
+            "event": "fact_stored", "operation": "ingest",
+            "version_id": version_id, "fact_id": fact_id,
+            "evidence_ids": ids, "extraction_method": fact.extraction_method,
+            "value": str(fact.value_decimal) if fact.value_decimal is not None else None,
+            "value_text_present": fact.value_text is not None, "unit": fact.unit,
+            "direction": fact.direction, "metric_chars": len(fact.metric),
+            "scope_chars": len(fact.scope or ""),
+            "reporting_period": fact.reporting_period,
+            "baseline_period": fact.baseline_period,
+        },
     )
     del metric_entity  # registered for graph traversal, not needed inline
     return 1
@@ -944,6 +1071,13 @@ def retry_failed_facts(
     if version is None:
         raise NotFoundError(f"no document version with id {version_id}")
     reporter.document_id = int(version["document_id"])
+    logger.info(
+        "fact retry started",
+        extra={
+            "event": "fact_retry_started", "operation": "ingest",
+            "document_id": reporter.document_id, "version_id": version_id,
+        },
+    )
 
     pending = failed_fact_candidates(conn, version_id)
     reporter.start("extracting_facts", "Retrying failed passages", total=len(pending))
@@ -979,13 +1113,22 @@ def retry_failed_facts(
                 FACT_EXTRACTION_SYSTEM,
                 fact_extraction_prompt(candidate, subject),
             )
-        except OllamaError:
+        except OllamaError as exc:
             record_fact_failure(
                 conn, version_id, row["unit_key"], "model_unavailable"
             )
             conn.commit()
             reporter.warn(
                 "extracting_facts", "A passage could not be processed by the model"
+            )
+            logger.warning(
+                "fact retry deferred after model failure",
+                extra={
+                    "event": "fact_extraction_fallback", "operation": "ingest",
+                    "document_id": reporter.document_id, "version_id": version_id,
+                    "evidence_id": int(unit["id"]), "unit_key": row["unit_key"],
+                    "error_type": type(exc).__name__,
+                },
             )
             continue
         kept, _dropped = accept_llm_facts(extraction.facts, candidate, subject)
@@ -1044,6 +1187,17 @@ def retry_failed_facts(
         completed=1,
         total=1,
         details=_completion_details(report, reporter),
+    )
+    logger.info(
+        "fact retry completed",
+        extra={
+            "event": "fact_retry_completed", "operation": "ingest",
+            "document_id": reporter.document_id, "version_id": version_id,
+            "attempted_candidates": len(pending),
+            "successful_candidates": succeeded, "stored_facts": stored,
+            "remaining_candidates": len(remaining), "status": str(status),
+            "duration_seconds": reporter.elapsed_seconds,
+        },
     )
     return report
 

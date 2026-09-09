@@ -1,5 +1,10 @@
 """Evidence-first claim auditing over completed ``document_extract`` output."""
 
+import logging
+
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
+
 from .client import ClaimEvidence
 from .config import Settings
 from .errors import (
