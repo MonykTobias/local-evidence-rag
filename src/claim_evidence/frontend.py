@@ -20,6 +20,7 @@ from .db import (
     audit_candidates,
     audit_run,
     document_summaries,
+    document_scope,
     evidence_row,
     index_counts,
     regions_for,
@@ -27,6 +28,7 @@ from .db import (
     vector_dimension,
 )
 from .errors import IndexNotReadyError, NotFoundError, ValidationError
+from .model_client import ModelClient
 from .models import (
     AuditTrace,
     DecisionExplanation,
@@ -65,7 +67,7 @@ def health(
     session: requests.Session | None = None,
 ) -> HealthReport:
     """System diagnostics that never leak a credential or a connection string."""
-    report = HealthReport()
+    report = HealthReport(model_backend=settings.model_backend)
     if conn is None:
         report.problems.append("database connection is not open")
     else:
@@ -108,37 +110,26 @@ def health(
             report.embeddings = counts["embeddings"]
             report.facts = counts["facts"]
             report.stored_evidence_units = counts["stored_evidence"]
+            expected_model = settings.model_identifier(settings.embed_model)
+            for row in document_scope(conn, None):
+                if (
+                    row["embed_model"] != expected_model
+                    or int(row["embed_dim"]) != settings.embed_dimensions
+                ):
+                    report.problems.append(
+                        f"document {row['document_id']} was indexed with incompatible embeddings; re-ingest it"
+                    )
         except psycopg.Error:
             conn.rollback()
             # The driver message can carry the host and user; report the class.
             report.problems.append("database query failed")
 
-    installed = _installed_models(settings, session)
-    report.ollama_reachable = installed is not None
-    if installed is None:
-        report.problems.append("ollama is not reachable")
-    for role, name in (
-        ("embed", settings.embed_model),
-        ("chat", settings.chat_model),
-        ("vision", settings.vision_model),
-    ):
-        available = bool(installed and name in installed)
-        report.models.append(ModelHealth(role=role, name=name, available=available))
-        if installed is not None and not available:
-            report.problems.append(f"{role} model {name} is not pulled")
+    reachable, models, problems = ModelClient(settings, session).health()
+    report.model_server_reachable = reachable
+    report.ollama_reachable = reachable if settings.model_backend == "ollama" else False
+    report.models = models
+    report.problems.extend(problems)
     return report
-
-
-def _installed_models(
-    settings: Settings, session: requests.Session | None
-) -> set[str] | None:
-    http = session or requests
-    try:
-        response = http.get(f"{settings.ollama_base_url}/api/tags", timeout=10)
-        response.raise_for_status()
-        return {m["name"] for m in response.json().get("models", [])}
-    except (requests.RequestException, ValueError, KeyError, TypeError):
-        return None
 
 
 # --- documents --------------------------------------------------------------

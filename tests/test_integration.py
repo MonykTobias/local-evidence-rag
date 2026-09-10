@@ -1312,6 +1312,213 @@ def check_invalid_scope_costs_nothing(tmp: Path) -> None:
         check(after == before, "no audit row was created")
 
 
+def check_backend_mismatch_costs_nothing(tmp: Path) -> None:
+    """A backend switch is rejected before model calls or database writes."""
+    from dataclasses import replace
+
+    root = build_root(tmp / "backend-mismatch")
+    with make_client(default_session()) as source:
+        indexed = source.ingest_document(
+            root, source_uri="urn:backend-mismatch", reporting_entity=ENTITY
+        )
+        session = default_session()
+        config = replace(settings(), model_backend="llamacpp")
+        with ClaimEvidence(
+            config, connect(config.database_url), OllamaClient(config, session)
+        ) as client:
+            before_audits = client.conn.execute(
+                "SELECT count(*) AS n FROM audit_run"
+            ).fetchone()["n"]
+            before_version = client.conn.execute(
+                "SELECT status, fact_candidates_total, fact_candidates_succeeded"
+                " FROM document_version WHERE id = %s",
+                (indexed.version_id,),
+            ).fetchone()
+            before_failures = client.conn.execute(
+                "SELECT count(*) AS n FROM fact_candidate_failure WHERE version_id = %s",
+                (indexed.version_id,),
+            ).fetchone()["n"]
+
+            _expect(
+                IndexNotReadyError,
+                lambda: client.search_evidence(
+                    SUPPORTED, document_ids=[indexed.document_id]
+                ),
+                "search rejects an index from another backend",
+            )
+            _expect(
+                IndexNotReadyError,
+                lambda: client.audit_claim(
+                    SUPPORTED,
+                    scope=[indexed.document_id],
+                    reporting_entity=ENTITY,
+                ),
+                "audit rejects an index from another backend",
+            )
+            _expect(
+                IndexNotReadyError,
+                lambda: client.retry_facts(indexed.document_id),
+                "fact retry rejects an index from another backend",
+            )
+            _expect(
+                IndexNotReadyError,
+                lambda: client.search_evidence(SUPPORTED),
+                "an unscoped mixed-backend search is rejected",
+            )
+            _expect(
+                IndexNotReadyError,
+                lambda: client.audit_claim(
+                    SUPPORTED, scope="all", reporting_entity=ENTITY
+                ),
+                "an unscoped mixed-backend audit is rejected",
+            )
+
+            check(not session.requests, "the incompatible index made no model request")
+            after_audits = client.conn.execute(
+                "SELECT count(*) AS n FROM audit_run"
+            ).fetchone()["n"]
+            after_version = client.conn.execute(
+                "SELECT status, fact_candidates_total, fact_candidates_succeeded"
+                " FROM document_version WHERE id = %s",
+                (indexed.version_id,),
+            ).fetchone()
+            after_failures = client.conn.execute(
+                "SELECT count(*) AS n FROM fact_candidate_failure WHERE version_id = %s",
+                (indexed.version_id,),
+            ).fetchone()["n"]
+            check(after_audits == before_audits, "no audit row was created")
+            check(
+                after_version == before_version and after_failures == before_failures,
+                "fact retry did not mutate the version",
+            )
+
+            replacement = client.ingest_document(
+                root,
+                source_uri="urn:backend-mismatch",
+                reporting_entity=ENTITY,
+            )
+            check(
+                replacement.document_id == indexed.document_id
+                and replacement.version_id != indexed.version_id
+                and replacement.status is VersionStatus.READY,
+                "re-ingestion activates a compatible replacement",
+            )
+            check(
+                bool(
+                    client.search_evidence(
+                        SUPPORTED, document_ids=[replacement.document_id]
+                    )
+                ),
+                "the replacement is queryable through llama.cpp",
+            )
+
+        source.remove_document(
+            indexed.document_id, confirm_document_id=indexed.document_id
+        )
+
+
+def check_llamacpp_runs_the_public_pipeline(tmp: Path) -> None:
+    """The public pipeline works through llama.cpp's wire format."""
+    from dataclasses import replace
+
+    source_text = f"{SUPPORTED} This statement is from the annual report."
+    chart_claim = "The chart shows emissions falling by 40.2%."
+
+    def adjudicate(payload: dict[str, Any]) -> dict[str, Any]:
+        if chart_claim in payload["messages"][1]["content"]:
+            return {
+                "verdict": "supported",
+                "rationale": "The verified crop shows the figure.",
+                "supporting_evidence_ids": _visual_ids(payload),
+                "missing_qualifiers": [],
+            }
+        return adjudication_reply(payload)
+
+    session = default_session(
+        ClaimSplit=lambda _: {"claims": [{"text": SUPPORTED}]},
+        EntailmentBatch=lambda _: {
+            "checks": [
+                {"claim_index": 0, "outcome": "entailed", "reason_code": "scripted"}
+            ]
+        },
+        Adjudication=adjudicate,
+        VisualVerification=lambda _: {
+            "result": "support",
+            "visible_text": "-40.2% vs 2020",
+            "reason_code": "value_and_metric_visible",
+        },
+    )
+    config = replace(settings(), model_backend="llamacpp")
+    with ClaimEvidence(
+        config, connect(config.database_url), OllamaClient(config, session)
+    ) as client:
+        indexed = client.ingest_document(
+            build_root(tmp / "llamacpp-pipeline", with_visual=True),
+            source_uri="urn:llamacpp-pipeline",
+            reporting_entity=ENTITY,
+        )
+        check(
+            indexed.status is VersionStatus.READY,
+            "llama.cpp ingestion reaches ready",
+        )
+        check(
+            bool(client.search_evidence(SUPPORTED, document_ids=[indexed.document_id])),
+            "llama.cpp search returns evidence",
+        )
+        decomposition = client.decompose_claims(
+            source_text, reporting_entity=ENTITY
+        )
+        check(
+            decomposition.claims[0].text == SUPPORTED,
+            "llama.cpp decomposition is grounded",
+        )
+        verification = client.verify_claims(
+            source_text, [SUPPORTED], reporting_entity=ENTITY
+        )
+        check(verification.ok, "llama.cpp claim verification passes")
+        deterministic = client.audit_claim(
+            SUPPORTED, scope=[indexed.document_id], reporting_entity=ENTITY
+        )
+        check(
+            deterministic.verdict is Verdict.SUPPORTED,
+            "llama.cpp deterministic audit is supported",
+        )
+        semantic = client.audit_claim(
+            VAGUE, scope=[indexed.document_id], reporting_entity=ENTITY
+        )
+        check(
+            semantic.verdict is Verdict.INSUFFICIENT,
+            "llama.cpp semantic audit is validated",
+        )
+        identities = client.conn.execute(
+            "SELECT dv.embed_model, ar.chat_model, ar.embed_model AS audit_embed_model"
+            " FROM document_version dv JOIN audit_run ar ON ar.id = %s"
+            " WHERE dv.id = %s",
+            (semantic.audit_id, indexed.version_id),
+        ).fetchone()
+        check(
+            all(str(value).startswith("llamacpp:") for value in identities.values()),
+            "stored model identifiers name llama.cpp",
+        )
+        visual = client.audit_claim(
+            chart_claim, scope=[indexed.document_id], reporting_entity=ENTITY
+        )
+        check(
+            any(
+                citation.quality is EvidenceQuality.VERIFIED_VISUAL
+                for citation in visual.citations
+            ),
+            "llama.cpp vision verifies a real crop",
+        )
+        check(
+            all(url.endswith(("/v1/embeddings", "/v1/chat/completions")) for url, _ in session.requests),
+            "the pipeline used only llama.cpp inference endpoints",
+        )
+        client.remove_document(
+            indexed.document_id, confirm_document_id=indexed.document_id
+        )
+
+
 def check_empty_index_is_not_an_insufficient_verdict(tmp: Path) -> None:
     with make_client(default_session()) as client:
         client.conn.execute("DELETE FROM document")
@@ -2107,6 +2314,8 @@ def main() -> int:
         check_embedding_dimension_mismatch_is_detected,
         check_document_scope_is_validated,
         check_invalid_scope_costs_nothing,
+        check_backend_mismatch_costs_nothing,
+        check_llamacpp_runs_the_public_pipeline,
         # Near the end: these add their own documents, and the checks above
         # audit with scope="all".
         check_mapped_markdown_bridges_two_blocks,

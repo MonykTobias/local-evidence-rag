@@ -34,7 +34,7 @@ from .models import (
     SourceToken,
 )
 from .normalize import clean_text, normalize_for_match
-from .ollama import OllamaClient, OllamaError
+from .model_client import ModelClient, ModelError
 
 # A post that decomposes into more than this is not one post's worth of claims.
 # Refused rather than truncated: silently auditing the first twenty of thirty
@@ -252,14 +252,14 @@ def _fail_closed(what: str) -> DependencyUnavailableError:
     """A model that was unreachable or twice unparseable is a dependency
     failure the caller may retry -- never a silently smaller result.
 
-    The ``OllamaError`` stays the ``__cause__`` for the local log: its message
+    The ``ModelError`` stays the ``__cause__`` for the local log: its message
     embeds the model's own reply, which is not something a caller may read.
     """
     return DependencyUnavailableError(f"the {what} is unavailable; nothing was audited")
 
 
 def decompose_claims(
-    client: OllamaClient, text: str, *, reporting_entity: str
+    client: ModelClient, text: str, *, reporting_entity: str
 ) -> ClaimDecomposition:
     """Propose the atomic claims in one post, each grounded back to its source.
 
@@ -272,7 +272,7 @@ def decompose_claims(
         split = client.structured(
             ClaimSplit, SPLIT_SYSTEM, split_prompt(source, reporting_entity)
         )
-    except OllamaError as exc:
+    except ModelError as exc:
         raise _fail_closed("claim splitter") from exc
 
     proposals = [clean_text(claim.text) for claim in split.claims]
@@ -294,7 +294,7 @@ def decompose_claims(
 
 
 def verify_entailment(
-    client: OllamaClient, source_text: str, claims: list[GroundedClaim]
+    client: ModelClient, source_text: str, claims: list[GroundedClaim]
 ) -> list[EntailmentCheck]:
     """One batched semantic check that the post really asserts each claim.
 
@@ -318,7 +318,7 @@ def verify_entailment(
             ENTAILMENT_SYSTEM,
             entailment_prompt(source_text, claims),
         )
-    except OllamaError as exc:
+    except ModelError as exc:
         raise _fail_closed("entailment verifier") from exc
 
     by_index = {check.claim_index: check for check in batch.checks}
@@ -331,7 +331,7 @@ def verify_entailment(
 
 
 def verify_claims(
-    client: OllamaClient,
+    client: ModelClient,
     source_text: str,
     claims: list[str],
     *,

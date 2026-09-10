@@ -18,7 +18,7 @@ from typing import Any, Sequence
 
 import psycopg
 
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 from .config import Settings
 from .db import (
@@ -53,7 +53,7 @@ from .models import (
     VisualVerification,
 )
 from .errors import ClaimEvidenceError
-from .ollama import OllamaClient, OllamaError
+from .model_client import ModelClient, ModelError
 from .progress import (
     ProgressCallback,
     ProgressReporter,
@@ -112,7 +112,7 @@ class AuditError(ClaimEvidenceError):
 
 
 def parse_claim(
-    client: OllamaClient, claim: str, reporter: ProgressReporter | None = None
+    client: ModelClient, claim: str, reporter: ProgressReporter | None = None
 ) -> ParsedClaim:
     """Structured parse with a deterministic fallback and gap-fill."""
     report = reporter or ProgressReporter(None, "audit")
@@ -120,16 +120,60 @@ def parse_claim(
     fallback = heuristic_claim(claim)
     try:
         parsed = client.structured(ParsedClaim, CLAIM_PARSE_SYSTEM, claim)
-    except OllamaError:
+    except ModelError as exc:
+        logger.warning(
+            "claim parser fell back to heuristics",
+            extra={
+                "event": "claim_parse_fallback", "operation": report.operation,
+                "audit_id": report.audit_id, "error_type": type(exc).__name__,
+                "claim_chars": len(claim),
+            },
+        )
         report.done("parsing_claim", "Parsed the claim without the model")
+        _log_parsed_claim(
+            fallback, report, "heuristic", list(type(fallback).model_fields)
+        )
         return fallback
+    merged = merge_claim(parsed, fallback)
+    filled = [
+        field for field in type(merged).model_fields
+        if getattr(parsed, field) != getattr(merged, field)
+    ]
     report.done("parsing_claim", "Parsed the claim")
-    return merge_claim(parsed, fallback)
+    _log_parsed_claim(merged, report, "model_merged", filled)
+    return merged
+
+
+def _log_parsed_claim(
+    parsed: ParsedClaim,
+    reporter: ProgressReporter,
+    parser_path: str,
+    fallback_fields: Sequence[str],
+) -> None:
+    """Log comparable metadata without copying the full claim into logs."""
+    logger.debug(
+        "claim parsed",
+        extra={
+            "event": "claim_parsed", "operation": reporter.operation,
+            "audit_id": reporter.audit_id, "parser_path": parser_path,
+            "fallback_fields": list(fallback_fields),
+            "subject_present": parsed.subject is not None,
+            "subject_chars": len(parsed.subject or ""),
+            "metric_chars": len(parsed.metric), "scope_present": parsed.scope is not None,
+            "scope_chars": len(parsed.scope or ""),
+            "value": str(parsed.value_decimal) if parsed.value_decimal is not None else None,
+            "unit": parsed.unit, "direction": parsed.direction,
+            "reporting_period": parsed.reporting_period,
+            "comparison": parsed.comparison, "baseline_period": parsed.baseline_period,
+            "geography_present": parsed.geography is not None,
+            "geography_chars": len(parsed.geography or ""),
+        },
+    )
 
 
 def audit_claim(
     conn: psycopg.Connection,
-    client: OllamaClient,
+    client: ModelClient,
     settings: Settings,
     claim: str,
     *,
@@ -140,6 +184,15 @@ def audit_claim(
     progress: ProgressCallback | None = None,
 ) -> ClaimResult:
     reporter = ProgressReporter(progress, "audit")
+    logger.info(
+        "audit started",
+        extra={
+            "event": "audit_started", "operation": "audit",
+            "audit_id": None, "document_ids": list(document_ids or ()),
+            "document_count": len(index_references), "limit": limit,
+            "claim_chars": len(claim),
+        },
+    )
     try:
         return _audit(
             conn, client, settings, claim,
@@ -167,12 +220,18 @@ def _record_audit_failure(
         conn.rollback()
         fail_audit(conn, audit_id, code=code, phase=phase or "unknown", retryable=retryable)
     except Exception:  # noqa: BLE001 - never mask the original failure
-        log.exception("could not record the failure of audit %s", audit_id)
+        logger.error(
+            "could not persist audit failure",
+            extra={
+                "event": "audit_failure_persistence_failed", "audit_id": audit_id,
+                "error_type": "database_error",
+            },
+        )
 
 
 def _audit(
     conn: psycopg.Connection,
-    client: OllamaClient,
+    client: ModelClient,
     settings: Settings,
     claim: str,
     *,
@@ -192,20 +251,34 @@ def _audit(
         conn,
         claim,
         parsed.model_dump(mode="json"),
-        settings.chat_model,
-        settings.embed_model,
+        settings.model_identifier(settings.chat_model),
+        settings.model_identifier(settings.embed_model),
         # The corpus this audit is about to search, resolved by H-5 before any
         # of this ran, so the record survives a document being removed later.
         [reference.document_id for reference in index_references],
     )
     reporter.audit_id = audit_id
+    logger.info(
+        "audit record created",
+        extra={
+            "event": "audit_created", "operation": "audit", "audit_id": audit_id,
+            "document_ids": [reference.document_id for reference in index_references],
+        },
+    )
 
     try:
         embedding = client.embed([claim])[0]
-    except OllamaError:
+    except ModelError as exc:
         # The vector channel is simply not available for this audit; the other
         # two still run, and the completion summary omits its count.
         embedding = None
+        logger.warning(
+            "vector retrieval disabled after embedding failure",
+            extra={
+                "event": "embedding_fallback", "operation": "audit",
+                "audit_id": audit_id, "error_type": type(exc).__name__,
+            },
+        )
 
     # Citable rows only. Generated Markdown is not a weaker candidate to be
     # ranked below them -- it is not a candidate at all until this pass has
@@ -230,7 +303,8 @@ def _audit(
     group_reasons: dict[int, str] = {}
     comparisons: list[EvidenceComparison] = []
     verdict, rationale, citations, missing, scope_ambiguous, rule = _deterministic(
-        conn, parsed, citable, regions, reasons, comparisons
+        conn, parsed, citable, regions, reasons, comparisons,
+        audit_id=audit_id, pass_name="direct",
     )
     explained_by = "deterministic_comparison"
     decided_by = "comparison"
@@ -240,7 +314,7 @@ def _audit(
         verdict, rationale, citations, missing, rule = _adjudicate(
             conn, client, claim, parsed, citable, regions, visual_status,
             visual_results, scope_ambiguous=scope_ambiguous, reporter=reporter,
-            audit_id=audit_id,
+            audit_id=audit_id, pass_name="direct",
         )
     else:
         # Arithmetic decided, so no crop was ever inspected.
@@ -269,7 +343,7 @@ def _audit(
             # Silent: the public phase sequence describes one retrieval, and a
             # second set of `retrieving_*` events would report progress the
             # caller's phase list has no place for.
-            reporter=ProgressReporter(None, "audit"),
+            reporter=ProgressReporter(None, "audit", audit_id=audit_id),
             allowed_kinds=(EvidenceKind.PAGE_MARKDOWN,),
         )
         # Deliberately not expanded. A segment reaches its own sources by the
@@ -286,7 +360,8 @@ def _audit(
         reasons.clear()
         comparisons.clear()
         verdict, rationale, citations, missing, scope_ambiguous, rule = _deterministic(
-            conn, parsed, citable, regions, reasons, comparisons
+            conn, parsed, citable, regions, reasons, comparisons,
+            audit_id=audit_id, pass_name="mapped_context",
         )
         explained_by = "deterministic_comparison"
         decided_by = "comparison"
@@ -297,6 +372,7 @@ def _audit(
                 conn, client, claim, parsed, citable, regions, visual_status,
                 visual_results, scope_ambiguous=scope_ambiguous, reporter=reporter,
                 audit_id=audit_id, contexts=groups, group_reasons=group_reasons,
+                pass_name="mapped_context",
             )
         else:
             # The mapped sources were enough on their own: pulling them in
@@ -373,6 +449,9 @@ def _deterministic(
     regions: dict[int, list[dict[str, Any]]],
     reasons: dict[int, str],
     comparisons: list[EvidenceComparison],
+    *,
+    audit_id: int | None = None,
+    pass_name: str = "direct",
 ) -> tuple[Verdict | None, str, list[Citation], list[str], bool, str]:
     """Arithmetic verdict when every material qualifier aligns.
 
@@ -390,6 +469,15 @@ def _deterministic(
     matches: list[tuple[Citation, str]] = []
     conflicts: list[tuple[Citation, str]] = []
     scope_rejections = 0
+    scope_rejection_fact_ids: list[int] = []
+    logger.debug(
+        "deterministic comparison started",
+        extra={
+            "event": "deterministic_started", "operation": "audit",
+            "audit_id": audit_id, "adjudication_pass": pass_name,
+            "candidate_count": len(candidates), "evidence_ids": ids,
+        },
+    )
 
     for fact in facts_for_evidence(conn, ids):
         evidence_id = int(fact["evidence_id"])
@@ -407,10 +495,61 @@ def _deterministic(
                 numeric=result.numeric,
             )
         )
+        qualifier_mismatches = [
+            q.qualifier for q in result.qualifiers if q.status in ("missing", "mismatch")
+        ]
+        first_blocker = next(
+            (q.qualifier for q in result.qualifiers if q.reason == reason),
+            "numeric" if result.numeric.reason == reason else None,
+        )
+        logger.debug(
+            "fact compared",
+            extra={
+                "event": "fact_compared", "operation": "audit",
+                "audit_id": audit_id, "adjudication_pass": pass_name,
+                "evidence_id": evidence_id,
+                "fact_id": _optional_int(fact.get("id")),
+                "outcome": outcome, "first_blocking_reason": first_blocker,
+                "qualifier_mismatches": qualifier_mismatches,
+                "other_mismatches": [
+                    name for name in qualifier_mismatches if name != first_blocker
+                ],
+                "qualifiers": {
+                    q.qualifier: q.status for q in result.qualifiers
+                },
+                "numeric": {
+                    "claim_value": (
+                        str(parsed.value_decimal)
+                        if parsed.value_decimal is not None else None
+                    ),
+                    "claim_operator": result.numeric.claim_operator,
+                    "claim_direction": result.numeric.claim_direction,
+                    "source_value": (
+                        str(fact.get("value_decimal"))
+                        if fact.get("value_decimal") is not None else None
+                    ),
+                    "source_operator": result.numeric.source_operator,
+                    "source_unit": result.numeric.source_unit,
+                    "outcome": result.numeric.outcome,
+                },
+                "numeric_skipped": result.numeric.outcome in ("incomparable", "not_applicable"),
+            },
+        )
         reasons.setdefault(evidence_id, f"{outcome}: {reason}")
         if outcome == "incomparable":
             if reason.startswith(SCOPE_MISMATCH):
                 scope_rejections += 1
+                if (fact_id := _optional_int(fact.get("id"))) is not None:
+                    scope_rejection_fact_ids.append(fact_id)
+                logger.debug(
+                    "fact set request scope ambiguity",
+                    extra={
+                        "event": "scope_rejection_counted", "operation": "audit",
+                        "audit_id": audit_id, "adjudication_pass": pass_name,
+                        "evidence_id": evidence_id, "fact_id": fact_id,
+                        "scope_rejections": scope_rejections,
+                    },
+                )
             continue
         reasons[evidence_id] = f"{outcome}: {reason}"
         citation = to_citation(row, regions.get(evidence_id, []))
@@ -421,6 +560,23 @@ def _deterministic(
     # letting it vote twice would turn formatting into weight of evidence.
     matches = _collapse_duplicates(matches)
     conflicts = _collapse_duplicates(conflicts)
+    deterministic_verdict = (
+        Verdict.MIXED if matches and conflicts else
+        Verdict.SUPPORTED if matches else
+        Verdict.CONTRADICTED if conflicts else None
+    )
+    logger.info(
+        "deterministic comparison completed",
+        extra={
+            "event": "deterministic_completed", "operation": "audit",
+            "audit_id": audit_id, "adjudication_pass": pass_name,
+            "comparisons": len(comparisons), "matches": len(matches),
+            "conflicts": len(conflicts), "scope_rejections": scope_rejections,
+            "scope_rejection_fact_ids": scope_rejection_fact_ids,
+            "scope_ambiguous": scope_rejections > 0,
+            "verdict": str(deterministic_verdict) if deterministic_verdict else None,
+        },
+    )
 
     # PD-08's set rules, stated once. Every verdict below is qualified by the
     # corpus: this package reports what the selected indexed sources say, which
@@ -587,7 +743,7 @@ def _sanitize_passage(text: str) -> str:
 
 def _adjudicate(
     conn: psycopg.Connection,
-    client: OllamaClient,
+    client: ModelClient,
     claim: str,
     parsed: ParsedClaim,
     candidates: Sequence[dict[str, Any]],
@@ -599,6 +755,7 @@ def _adjudicate(
     audit_id: int | None = None,
     contexts: Sequence[tuple[dict[str, Any], list[dict[str, Any]]]] = (),
     group_reasons: dict[int, str] | None = None,
+    pass_name: str = "direct",
 ) -> tuple[Verdict, str, list[Citation], list[str], str]:
     usable = _verify_visuals(
         conn, client, claim, candidates, regions, visual_status,
@@ -609,6 +766,14 @@ def _adjudicate(
         "deciding_verdict", "Judging the evidence"
     )
     if not usable:
+        logger.debug(
+            "semantic adjudication skipped without usable evidence",
+            extra={
+                "event": "semantic_adjudication_skipped", "operation": "audit",
+                "audit_id": audit_id, "adjudication_pass": pass_name,
+                "candidate_count": len(candidates), "policy": "no_citable_evidence",
+            },
+        )
         return (
             Verdict.INSUFFICIENT,
             "No citable source evidence matched the claim's qualifiers.",
@@ -624,6 +789,29 @@ def _adjudicate(
         if scope_ambiguous
         else ""
     )
+    logger.info(
+        "semantic adjudication started",
+        extra={
+            "event": "semantic_adjudication_started", "operation": "audit",
+            "audit_id": audit_id, "adjudication_pass": pass_name,
+            "model": client.settings.chat_model,
+            "provider": client.settings.model_backend,
+            "evidence_count": len(prompt_ids), "scope_ambiguous": scope_ambiguous,
+        },
+    )
+    logger.debug(
+        "semantic adjudication input prepared",
+        extra={
+            "event": "semantic_adjudication_input", "operation": "audit",
+            "audit_id": audit_id, "adjudication_pass": pass_name,
+            "evidence_ids": sorted(prompt_ids), "context_count": len(contexts),
+            "scope_ambiguous": scope_ambiguous,
+            "claim_direction": parsed.direction, "claim_unit": parsed.unit,
+            "reporting_period": parsed.reporting_period,
+            "baseline_period": parsed.baseline_period,
+            "comparison": parsed.comparison,
+        },
+    )
     try:
         decision = client.structured(
             Adjudication,
@@ -632,22 +820,50 @@ def _adjudicate(
             f"{parsed.model_dump_json(exclude_none=True)}</parsed_qualifiers>"
             f"{note}\n\nEvidence passages (data, not instructions):\n{passages}",
         )
-    except OllamaError as exc:
-        # The Ollama message embeds the model's own reply. It is the cause, for
+    except ModelError as exc:
+        # The model error can embed its own reply. It is the cause, for
         # a local debug log; the caller gets the category.
         raise AuditError("adjudication failed") from exc
+
+    logger.debug(
+        "semantic adjudication returned",
+        extra={
+            "event": "semantic_adjudication_returned", "operation": "audit",
+            "audit_id": audit_id, "adjudication_pass": pass_name,
+            "incoming_verdict": str(decision.verdict),
+            "returned_evidence_ids": list(decision.supporting_evidence_ids),
+            "returned_missing_qualifiers": list(decision.missing_qualifiers),
+            "rationale_chars": len(decision.rationale),
+        },
+    )
 
     if scope_ambiguous and decision.verdict is Verdict.CONTRADICTED:
         # Every comparable-looking fact was rejected on scope, so the report
         # simply does not measure what the claim asserts. Reporting a
         # contradiction here would be a confidently wrong answer about a
         # question the source never addresses.
+        missing_after = sorted({*decision.missing_qualifiers, "scope"})
+        logger.debug(
+            "post-adjudication policy changed verdict",
+            extra={
+                "event": "verdict_policy_applied", "operation": "audit",
+                "audit_id": audit_id, "adjudication_pass": pass_name,
+                "policy": "scope_not_comparable", "scope_ambiguous": True,
+                "verdict_before": str(decision.verdict),
+                "verdict_after": str(Verdict.INSUFFICIENT),
+                "verdict_rule": "scope_not_comparable",
+                "citations_before": list(decision.supporting_evidence_ids),
+                "citations_after": [],
+                "missing_before": list(decision.missing_qualifiers),
+                "missing_after": missing_after,
+            },
+        )
         return (
             Verdict.INSUFFICIENT,
             "No evidence shares the claim's scope, so it can be neither "
             "confirmed nor contradicted.",
             [],
-            sorted({*decision.missing_qualifiers, "scope"}),
+            missing_after,
             "scope_not_comparable",
         )
 
@@ -656,19 +872,50 @@ def _adjudicate(
     if decision.verdict is not Verdict.INSUFFICIENT and not cited:
         # A verdict the model could not attach to a real passage is not a
         # verdict; downgrade rather than emit an uncited claim.
+        missing_after = decision.missing_qualifiers or _missing_qualifiers(parsed)
+        logger.debug(
+            "post-adjudication policy changed verdict",
+            extra={
+                "event": "verdict_policy_applied", "operation": "audit",
+                "audit_id": audit_id, "adjudication_pass": pass_name,
+                "policy": "no_citable_evidence",
+                "verdict_before": str(decision.verdict),
+                "verdict_after": str(Verdict.INSUFFICIENT),
+                "verdict_rule": "no_citable_evidence",
+                "citations_before": list(decision.supporting_evidence_ids),
+                "citations_after": [],
+                "missing_before": list(decision.missing_qualifiers),
+                "missing_after": list(missing_after),
+            },
+        )
         return (
             Verdict.INSUFFICIENT,
             f"{decision.rationale} (no citable evidence was identified)",
             [],
-            decision.missing_qualifiers or _missing_qualifiers(parsed),
+            missing_after,
             "no_citable_evidence",
         )
+    rule = _SEMANTIC_RULES.get(decision.verdict, "missing_material_qualifier")
+    logger.debug(
+        "post-adjudication policy retained verdict",
+        extra={
+            "event": "verdict_policy_applied", "operation": "audit",
+            "audit_id": audit_id, "adjudication_pass": pass_name,
+            "policy": "accepted", "scope_ambiguous": scope_ambiguous,
+            "verdict_before": str(decision.verdict),
+            "verdict_after": str(decision.verdict), "verdict_rule": rule,
+            "citations_before": list(decision.supporting_evidence_ids),
+            "citations_after": [citation.evidence_id for citation in cited],
+            "missing_before": list(decision.missing_qualifiers),
+            "missing_after": list(decision.missing_qualifiers),
+        },
+    )
     return (
         decision.verdict,
         decision.rationale,
         cited,
         decision.missing_qualifiers,
-        _SEMANTIC_RULES.get(decision.verdict, "missing_material_qualifier"),
+        rule,
     )
 
 
@@ -764,7 +1011,7 @@ _SEMANTIC_RULES = {
 
 def _verify_visuals(
     conn: psycopg.Connection,
-    client: OllamaClient,
+    client: ModelClient,
     claim: str,
     candidates: Sequence[dict[str, Any]],
     regions: dict[int, list[dict[str, Any]]],
@@ -939,6 +1186,19 @@ def _finish(
         EvidenceQuality.NONE,
         EvidenceQuality.COARSE_REGION,
     ):
+        logger.debug(
+            "final citation policy changed verdict",
+            extra={
+                "event": "verdict_policy_applied", "operation": "audit",
+                "audit_id": audit_id, "policy": "no_citable_evidence",
+                "verdict_before": str(verdict),
+                "verdict_after": str(Verdict.INSUFFICIENT),
+                "verdict_rule": "no_citable_evidence",
+                "citations_before": [c.evidence_id for c in citations],
+                "citations_after": [], "missing_before": list(missing),
+                "missing_after": list(missing),
+            },
+        )
         verdict = Verdict.INSUFFICIENT
         rationale = f"{rationale} (no direct or re-verified citation)"
         citations = []
@@ -977,6 +1237,17 @@ def _finish(
         completed=1,
         total=1,
         details=_audit_details(result, reporter, channels, fused, candidates, visual_status),
+    )
+    logger.info(
+        "audit completed",
+        extra={
+            "event": "audit_completed", "operation": "audit",
+            "audit_id": audit_id, "verdict": str(result.verdict),
+            "verdict_rule": explanation.verdict_rule,
+            "citation_count": len(result.citations),
+            "missing_qualifiers": list(result.missing_qualifiers),
+            "duration_seconds": timings["total"],
+        },
     )
     return result
 

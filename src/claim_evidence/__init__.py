@@ -1,5 +1,10 @@
 """Evidence-first claim auditing over completed ``document_extract`` output."""
 
+import logging
+
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
+
 from .client import ClaimEvidence
 from .config import Settings
 from .errors import (
@@ -10,6 +15,7 @@ from .errors import (
     ValidationError,
 )
 from .progress import ProgressCallback
+from .model_client import ModelClient, ModelError
 from .models import (
     AuditTrace,
     Citation,
@@ -68,6 +74,8 @@ __all__ = [
     "IndexReference",
     "IngestReport",
     "ModelHealth",
+    "ModelClient",
+    "ModelError",
     "NotFoundError",
     "NumericComparison",
     "ProgressCallback",

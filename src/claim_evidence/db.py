@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import re
 from datetime import datetime, timedelta, timezone
@@ -28,6 +29,8 @@ from psycopg.types.json import Jsonb
 from .config import DEFAULT_DATABASE_CONNECT_TIMEOUT
 from .errors import DependencyUnavailableError
 from .models import EvidenceUnit, Fact, VersionStatus
+
+logger = logging.getLogger(__name__)
 
 SQL_DIR = Path(__file__).parent / "sql"
 SCHEMA_PATH = SQL_DIR / "schema.sql"
@@ -102,6 +105,10 @@ def connect(
     driver's own message names the host, user, and sometimes the password, so
     it is kept as ``__cause__`` for the server log and never surfaced.
     """
+    logger.debug(
+        "database connection started",
+        extra={"event": "database_connect_started", "connect_timeout": connect_timeout},
+    )
     try:
         conn = psycopg.connect(
             database_url,
@@ -110,6 +117,10 @@ def connect(
             connect_timeout=max(1, int(connect_timeout)),
         )
     except psycopg.OperationalError as exc:
+        logger.error(
+            "database connection failed",
+            extra={"event": "database_connect_failed", "error_type": type(exc).__name__},
+        )
         raise DependencyUnavailableError("PostgreSQL is unavailable.") from exc
     try:
         register_vector(conn)
@@ -117,6 +128,7 @@ def connect(
         # The extension is created by `db init`; on a fresh database the vector
         # type does not exist yet and registration succeeds after init_schema.
         conn.rollback()
+    logger.debug("database connection completed", extra={"event": "database_connected"})
     return conn
 
 
@@ -185,6 +197,10 @@ def init_schema(conn: psycopg.Connection, embed_dim: int) -> str:
             and not problems
         ):
             register_vector(conn)
+            logger.debug(
+                "database schema already current",
+                extra={"event": "schema_checked", "schema_version": SCHEMA_VERSION},
+            )
             return "unchanged"
         raise SchemaMismatchError(
             _mismatch_message(marker, digest, problems)
@@ -212,6 +228,10 @@ def init_schema(conn: psycopg.Connection, embed_dim: int) -> str:
     )
     conn.commit()
     register_vector(conn)
+    logger.info(
+        "database schema initialized",
+        extra={"event": "schema_initialized", "schema_version": SCHEMA_VERSION},
+    )
     return "initialized"
 
 
@@ -356,7 +376,16 @@ def start_version(
          source_pdf, attempt),
     ).fetchone()
     conn.commit()
-    return int(row["id"])
+    version_id = int(row["id"])
+    logger.debug(
+        "document version transaction committed",
+        extra={
+            "event": "version_started", "operation": "start_version",
+            "document_id": document_id, "version_id": version_id,
+            "attempt": attempt, "force": force,
+        },
+    )
+    return version_id
 
 
 def activate_version(
@@ -384,6 +413,13 @@ def activate_version(
             "UPDATE document_version SET status = %s, ready_at = now() WHERE id = %s",
             (status, version_id),
         )
+    logger.debug(
+        "document version activation committed",
+        extra={
+            "event": "version_activated", "operation": "activate_version",
+            "version_id": version_id, "status": status,
+        },
+    )
 
 
 # --- fact coverage and targeted retry ---------------------------------------
@@ -637,6 +673,14 @@ def upsert_evidence(
         f" AND NOT (unit_key = ANY(%s)){_ONLY_BUILDING}",
         (version_id, page_id, list(ids), version_id),
     )
+    logger.debug(
+        "evidence page persisted",
+        extra={
+            "event": "evidence_upserted", "operation": "upsert_evidence",
+            "version_id": version_id, "page_id": page_id,
+            "evidence_count": len(ids), "evidence_ids": list(ids.values()),
+        },
+    )
     return ids
 
 
@@ -689,6 +733,14 @@ def set_embeddings(
             [(normalize_embedding(vec), evidence_id) for evidence_id, vec in rows],
         )
     conn.commit()
+    logger.debug(
+        "embedding batch committed",
+        extra={
+            "event": "embeddings_committed", "operation": "set_embeddings",
+            "evidence_count": len(rows),
+            "evidence_ids": [evidence_id for evidence_id, _ in rows],
+        },
+    )
 
 
 # --- entities and facts -----------------------------------------------------
@@ -768,6 +820,15 @@ def upsert_fact(
             " ON CONFLICT DO NOTHING",
             (fact_id, evidence_id),
         )
+    logger.debug(
+        "fact persisted",
+        extra={
+            "event": "fact_upserted", "operation": "upsert_fact",
+            "version_id": version_id, "fact_id": fact_id,
+            "evidence_ids": list(evidence_ids),
+            "extraction_method": fact.extraction_method,
+        },
+    )
     return fact_id
 
 
@@ -1086,7 +1147,16 @@ def create_audit(
         ),
     ).fetchone()
     conn.commit()
-    return int(row["id"])
+    audit_id = int(row["id"])
+    logger.debug(
+        "audit creation committed",
+        extra={
+            "event": "audit_persisted", "operation": "create_audit",
+            "audit_id": audit_id,
+            "document_ids": [int(i) for i in requested_document_ids],
+        },
+    )
+    return audit_id
 
 
 def fail_audit(
@@ -1108,6 +1178,14 @@ def fail_audit(
             """,
             (code, phase, retryable, audit_id),
         )
+    logger.debug(
+        "audit failure committed",
+        extra={
+            "event": "audit_failure_persisted", "operation": "fail_audit",
+            "audit_id": audit_id, "error_code": code, "phase": phase,
+            "retryable": retryable,
+        },
+    )
 
 
 def record_visual_verification(
@@ -1190,6 +1268,14 @@ def record_candidates(
             ],
         )
     conn.commit()
+    logger.debug(
+        "audit candidates committed",
+        extra={
+            "event": "audit_candidates_persisted", "operation": "record_candidates",
+            "audit_id": audit_id, "candidate_count": len(candidates),
+            "selected_count": sum(bool(c.get("selected")) for c in candidates),
+        },
+    )
 
 
 def finish_audit(
@@ -1228,6 +1314,15 @@ def finish_audit(
         ),
     )
     conn.commit()
+    logger.debug(
+        "audit result committed",
+        extra={
+            "event": "audit_result_persisted", "operation": "finish_audit",
+            "audit_id": audit_id, "verdict": verdict, "quality": quality,
+            "citation_count": len(citations),
+            "missing_qualifiers": list(missing_qualifiers),
+        },
+    )
 
 
 def _jsonable(value: Any) -> Any:

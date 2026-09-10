@@ -8,6 +8,7 @@ validation error instead of a verdict.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from decimal import Decimal
 from enum import StrEnum
@@ -16,6 +17,8 @@ from typing import Any, Literal, Self
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .errors import ValidationError
+
+logger = logging.getLogger(__name__)
 
 
 class PublicModel(BaseModel):
@@ -47,6 +50,13 @@ def _coerce_displayed_value(value: Any) -> Any:
         from .normalize import parse_value  # local: `normalize` imports this module
 
         parsed, _ = parse_value(value)
+        logger.debug(
+            "displayed model value coerced",
+            extra={
+                "event": "displayed_value_coerced", "raw_chars": len(value),
+                "normalized_value": str(parsed) if parsed is not None else None,
+            },
+        )
         return parsed
     return value
 
@@ -537,6 +547,8 @@ class HealthReport(PublicModel):
     driver exceptions, or prompts -- only categories and safe sentences."""
 
     database_reachable: bool = False
+    model_backend: Literal["ollama", "llamacpp"] = "ollama"
+    model_server_reachable: bool = False
     schema_version: int | None = None
     schema_current: bool = False
     pgvector_version: str | None = None

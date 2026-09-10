@@ -12,12 +12,15 @@ Two things in this module decide whether a citation is trustworthy:
 
 from __future__ import annotations
 
+import logging
 import re
 import unicodedata
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, Iterable
 
 from .models import GeometryPrecision, Region, RegionRole
+
+logger = logging.getLogger(__name__)
 
 # Bump when a change here would give the same source different stored evidence
 # -- different normalized text, a different region, a different parsed value.
@@ -168,6 +171,10 @@ def parse_value(raw: str) -> tuple[Decimal | None, str | None]:
     """
     text = clean_text(raw)
     if not text:
+        logger.debug(
+            "value normalization found no value",
+            extra={"event": "value_normalized", "raw_chars": len(raw), "normalized_value": None},
+        )
         return None, None
 
     negative = False
@@ -180,7 +187,15 @@ def parse_value(raw: str) -> tuple[Decimal | None, str | None]:
 
     match = _NUMBER_RE.search(stripped)
     if not match:
-        return None, unit_of(text)
+        unit = unit_of(text)
+        logger.debug(
+            "value normalization found no number",
+            extra={
+                "event": "value_normalized", "raw_chars": len(raw),
+                "raw_value": None, "normalized_value": None, "unit": unit,
+            },
+        )
+        return None, unit
 
     digits = re.sub(r"[\s,_]", "", match.group(0))
     # Trailing separators such as "1.234." are noise, not precision.
@@ -188,10 +203,27 @@ def parse_value(raw: str) -> tuple[Decimal | None, str | None]:
     try:
         value = Decimal(digits)
     except InvalidOperation:
-        return None, unit_of(text)
+        unit = unit_of(text)
+        logger.warning(
+            "numeric value could not be normalized",
+            extra={
+                "event": "value_normalization_failed", "raw_chars": len(raw),
+                "raw_value": match.group(0), "unit": unit,
+            },
+        )
+        return None, unit
     if negative and value > 0:
         value = -value
-    return value, unit_of(text)
+    unit = unit_of(text)
+    logger.debug(
+        "value normalized",
+        extra={
+            "event": "value_normalized", "raw_chars": len(raw),
+            "raw_value": match.group(0), "normalized_value": str(value),
+            "unit": unit, "accounting_negative": negative,
+        },
+    )
+    return value, unit
 
 
 def unit_of(text: str) -> str | None:
@@ -271,14 +303,39 @@ def normalize_unit(raw: str | None) -> str | None:
     if not lowered:
         return None
     if "%" in lowered or lowered.startswith("percentage") or lowered == "percent":
-        return "%"
+        canonical, method = "%", "percent"
+        logger.debug(
+            "unit normalized",
+            extra={
+                "event": "unit_normalized", "raw_chars": len(raw),
+                "normalized_unit": canonical, "normalization_method": method,
+            },
+        )
+        return canonical
     match = _CO2E_RE.match(lowered)
     if match:
         prefix = (match.group("prefix") or "").strip()
         canonical = _CO2E_PREFIX.get(prefix)
         if canonical:
-            return f"{canonical}co2e"
-    return _UNIT_ALIASES.get(lowered, lowered)
+            result = f"{canonical}co2e"
+            logger.debug(
+                "unit normalized",
+                extra={
+                    "event": "unit_normalized", "raw_chars": len(raw),
+                    "normalized_unit": result, "normalization_method": "co2e",
+                },
+            )
+            return result
+    result = _UNIT_ALIASES.get(lowered, lowered)
+    logger.debug(
+        "unit normalized",
+        extra={
+            "event": "unit_normalized", "raw_chars": len(raw),
+            "normalized_unit": result,
+            "normalization_method": "alias" if result != lowered else "unchanged",
+        },
+    )
+    return result
 
 
 # The spellings that really are a percent unit. `normalize_unit` answers "%" for
@@ -359,7 +416,22 @@ def normalize_period(value: str | None) -> str | None:
     match = _FY_RE.fullmatch(text) or _FY_RE.search(text)
     if match:
         year = match.group(1)
-        return f"FY{year if len(year) == 4 else '20' + year}"
+        result = f"FY{year if len(year) == 4 else '20' + year}"
+        logger.debug(
+            "period normalized",
+            extra={
+                "event": "period_normalized", "raw_chars": len(value),
+                "normalized_period": result, "normalization_method": "fiscal_year",
+            },
+        )
+        return result
+    logger.debug(
+        "period normalization left value unchanged",
+        extra={
+            "event": "period_normalized", "raw_chars": len(value),
+            "normalized_period": text, "normalization_method": "unchanged",
+        },
+    )
     return text
 
 

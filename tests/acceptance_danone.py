@@ -1,6 +1,6 @@
 """Live acceptance against the completed Danone run.
 
-Needs the real output root, a running PostgreSQL, and a running Ollama with the
+Needs the real output root, a running PostgreSQL, and the configured model server with the
 configured models. Skips cleanly when any of those is missing.
 
     docker compose up -d
@@ -19,9 +19,8 @@ from pathlib import Path
 
 
 import psycopg
-import requests
-
 from claim_evidence import ClaimEvidence, Settings
+from claim_evidence.model_client import ModelClient
 from claim_evidence.models import EvidenceQuality, Verdict
 
 OUTPUT_ROOT = Path(
@@ -61,13 +60,11 @@ def preflight(settings: Settings) -> str | None:
         psycopg.connect(settings.database_url, connect_timeout=5).close()
     except psycopg.OperationalError as exc:
         return f"postgres unavailable ({exc.__class__.__name__}); run: docker compose up -d"
-    try:
-        tags = requests.get(f"{settings.ollama_base_url}/api/tags", timeout=5).json()
-    except requests.RequestException as exc:
-        return f"ollama unavailable ({exc.__class__.__name__})"
-    names = {m["name"] for m in tags.get("models", [])}
-    if not any(n.startswith(settings.embed_model.split(":")[0]) for n in names):
-        return f"embedding model {settings.embed_model} not pulled"
+    reachable, models, problems = ModelClient(settings).health()
+    if not reachable:
+        return f"{settings.model_backend} unavailable"
+    if not all(model.available for model in models):
+        return problems[0] if problems else "a configured model is unavailable"
     return None
 
 

@@ -7,6 +7,8 @@ not decide what to ask.
 
 from __future__ import annotations
 
+import logging
+import time
 from pathlib import Path
 from typing import Sequence
 
@@ -49,9 +51,15 @@ from .models import (
     IngestReport,
     RemovalReport,
 )
-from .ollama import OllamaClient, OllamaError
+from .model_client import (
+    ModelClient,
+    ModelError,
+    require_compatible_embeddings,
+)
 from .progress import ProgressCallback
 from .retrieve import retrieve, to_matches
+
+logger = logging.getLogger(__name__)
 
 
 class ClaimEvidence:
@@ -59,13 +67,13 @@ class ClaimEvidence:
         self,
         settings: Settings,
         conn: psycopg.Connection | None = None,
-        client: OllamaClient | None = None,
+        client: ModelClient | None = None,
     ) -> None:
         self.settings = settings
         self.conn = conn or connect(
             settings.database_url, settings.database_connect_timeout
         )
-        self.ollama = client or OllamaClient(settings)
+        self.ollama = client or ModelClient(settings)
 
     @classmethod
     def from_env(cls) -> "ClaimEvidence":
@@ -122,9 +130,17 @@ class ClaimEvidence:
         summary = get_document(self.conn, identifier)
         deleted = delete_document(self.conn, identifier)
         self.conn.commit()
-        return RemovalReport(
+        report = RemovalReport(
             document_id=identifier, name=summary.name, deleted=deleted
         )
+        logger.info(
+            "document removed",
+            extra={
+                "event": "document_removed", "operation": "remove_document",
+                "document_id": identifier, "deleted_counts": deleted,
+            },
+        )
+        return report
 
     def get_audit_trace(self, audit_id: int | str) -> AuditTrace:
         return get_audit_trace(self.conn, audit_id)
@@ -219,6 +235,7 @@ class ClaimEvidence:
                 raise IndexNotReadyError(
                     "no ready document version; ingest a document first"
                 )
+            require_compatible_embeddings(self.settings, rows)
             return None, [_reference(row) for row in rows]
 
         wanted: list[int] = []
@@ -245,6 +262,7 @@ class ClaimEvidence:
             raise IndexNotReadyError(
                 f"document {unready[0]} has no ready version to query"
             )
+        require_compatible_embeddings(self.settings, rows)
         return unique, [_reference(row) for row in rows]
 
     def search_evidence(
@@ -262,17 +280,44 @@ class ClaimEvidence:
         is not a result at all, and a row of it would spend one of the `limit`
         answers the caller asked for.
         """
+        started = time.monotonic()
+        logger.info(
+            "evidence search started",
+            extra={
+                "event": "search_started", "operation": "search_evidence",
+                "document_ids": list(document_ids) if document_ids else None,
+                "limit": limit, "query_chars": len(query),
+            },
+        )
         scope, _references = self._resolve_scope(document_ids)
         parsed = heuristic_claim(query)
         try:
             embedding = self.ollama.embed([query])[0]
-        except OllamaError:
+        except ModelError as exc:
             embedding = None
+            logger.warning(
+                "evidence search fell back to lexical retrieval",
+                extra={
+                    "event": "search_embedding_fallback",
+                    "operation": "search_evidence",
+                    "document_ids": scope, "error_type": type(exc).__name__,
+                },
+            )
         candidates, _channels = retrieve(
             self.conn, embedding, parsed, query,
             document_ids=scope, limit=limit, allowed_kinds=None,
         )
-        return to_matches(self.conn, candidates)
+        matches = to_matches(self.conn, candidates)
+        logger.info(
+            "evidence search completed",
+            extra={
+                "event": "search_completed", "operation": "search_evidence",
+                "document_ids": scope, "result_count": len(matches),
+                "evidence_ids": [match.citation.evidence_id for match in matches],
+                "duration_seconds": round(time.monotonic() - started, 6),
+            },
+        )
+        return matches
 
     def check_claim(self, claim: str, *, reporting_entity: str) -> str:
         """Answer whether this claim can be submitted, without auditing it.
@@ -300,7 +345,26 @@ class ClaimEvidence:
         Every proposal comes back with the character offsets it was proved
         against, or the category under which that proof failed.
         """
-        return decompose_claims(self.ollama, text, reporting_entity=reporting_entity)
+        started = time.monotonic()
+        logger.info(
+            "claim decomposition started",
+            extra={
+                "event": "decomposition_started", "operation": "decompose_claims",
+                "source_chars": len(text),
+            },
+        )
+        result = decompose_claims(
+            self.ollama, text, reporting_entity=reporting_entity
+        )
+        logger.info(
+            "claim decomposition completed",
+            extra={
+                "event": "decomposition_completed", "operation": "decompose_claims",
+                "claim_count": len(result.claims),
+                "duration_seconds": round(time.monotonic() - started, 6),
+            },
+        )
+        return result
 
     def verify_claims(
         self, source_text: str, claims: Sequence[str], *, reporting_entity: str
@@ -312,12 +376,31 @@ class ClaimEvidence:
         the review step lets the user edit these rows, and an edited claim is a
         new proposal, not a checked one.
         """
-        return verify_claims(
+        started = time.monotonic()
+        logger.info(
+            "claim verification started",
+            extra={
+                "event": "claim_verification_started",
+                "operation": "verify_claims", "source_chars": len(source_text),
+                "claim_count": len(claims),
+            },
+        )
+        result = verify_claims(
             self.ollama,
             source_text,
             list(claims),
             reporting_entity=reporting_entity,
         )
+        logger.info(
+            "claim verification completed",
+            extra={
+                "event": "claim_verification_completed",
+                "operation": "verify_claims", "claim_count": len(result.claims),
+                "ok": result.ok,
+                "duration_seconds": round(time.monotonic() - started, 6),
+            },
+        )
+        return result
 
     def audit_claim(
         self,

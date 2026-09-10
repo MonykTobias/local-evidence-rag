@@ -1,15 +1,17 @@
 """Environment-driven settings.
 
 Every knob is a plain environment variable so the package can run against a
-managed PostgreSQL and a remote Ollama without a config file.
+managed PostgreSQL and a remote model server without a config file.
 """
 
 from __future__ import annotations
 
 import os
+import math
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .errors import ValidationError
 
@@ -24,6 +26,8 @@ DEFAULT_BUILD_STALE_MINUTES = 60.0
 # memory that would otherwise hold model layers on the GPU.
 DEFAULT_NUM_CTX = 16384
 DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
+DEFAULT_LLAMACPP_BASE_URL = "http://127.0.0.1:8080"
+DEFAULT_LLAMACPP_EMBED_BASE_URL = "http://127.0.0.1:8081"
 DEFAULT_EMBED_MODEL = "qwen3-embedding:4b"
 DEFAULT_EMBED_DIMENSIONS = 1024
 DEFAULT_CHAT_MODEL = "hf.co/unsloth/Qwen3-VL-4B-Instruct-GGUF:UD-Q8_K_XL"
@@ -62,6 +66,11 @@ class Settings:
     # one by accident.
     environment: str = ""
     app_marker: str = DEFAULT_APP_MARKER
+    model_backend: str = "ollama"
+    llamacpp_base_url: str = DEFAULT_LLAMACPP_BASE_URL
+    llamacpp_embed_base_url: str = DEFAULT_LLAMACPP_EMBED_BASE_URL
+    llamacpp_vision_base_url: str | None = None
+    llamacpp_api_key: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         # Validated for every construction path, not just from_env(), and the
@@ -69,11 +78,51 @@ class Settings:
         for variable, value in (
             ("CLAIM_EVIDENCE_DATABASE_CONNECT_TIMEOUT", self.database_connect_timeout),
             ("CLAIM_EVIDENCE_BUILD_STALE_MINUTES", self.build_stale_minutes),
+            ("CLAIM_EVIDENCE_REQUEST_TIMEOUT", self.request_timeout),
         ):
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+            ):
                 raise ValidationError(f"{variable} must be a positive number")
-        if isinstance(self.num_ctx, bool) or not isinstance(self.num_ctx, int) or self.num_ctx <= 0:
-            raise ValidationError("CLAIM_EVIDENCE_NUM_CTX must be a positive integer")
+        for variable, value in (
+            ("CLAIM_EVIDENCE_NUM_CTX", self.num_ctx),
+            ("CLAIM_EVIDENCE_EMBED_DIMENSIONS", self.embed_dimensions),
+            ("CLAIM_EVIDENCE_EMBED_BATCH_SIZE", self.embed_batch_size),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValidationError(f"{variable} must be a positive integer")
+
+        if not isinstance(self.model_backend, str):
+            raise ValidationError("CLAIM_EVIDENCE_MODEL_BACKEND must be ollama or llamacpp")
+        backend = self.model_backend.strip().lower()
+        if backend not in {"ollama", "llamacpp"}:
+            raise ValidationError("CLAIM_EVIDENCE_MODEL_BACKEND must be ollama or llamacpp")
+        object.__setattr__(self, "model_backend", backend)
+
+        key = self.llamacpp_api_key
+        if key is not None:
+            if not isinstance(key, str) or "\r" in key or "\n" in key:
+                raise ValidationError("CLAIM_EVIDENCE_LLAMACPP_API_KEY contains an invalid newline")
+            object.__setattr__(self, "llamacpp_api_key", key or None)
+
+        if backend == "llamacpp":
+            for field_name, variable in (
+                ("llamacpp_base_url", "CLAIM_EVIDENCE_LLAMACPP_BASE_URL"),
+                ("llamacpp_embed_base_url", "CLAIM_EVIDENCE_LLAMACPP_EMBED_BASE_URL"),
+            ):
+                object.__setattr__(self, field_name, _server_origin(getattr(self, field_name), variable))
+            if self.llamacpp_vision_base_url is not None:
+                object.__setattr__(
+                    self,
+                    "llamacpp_vision_base_url",
+                    _server_origin(
+                        self.llamacpp_vision_base_url,
+                        "CLAIM_EVIDENCE_LLAMACPP_VISION_BASE_URL",
+                    ),
+                )
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -97,27 +146,46 @@ class Settings:
             embed_model=os.environ.get(
                 "CLAIM_EVIDENCE_EMBED_MODEL", DEFAULT_EMBED_MODEL
             ),
-            embed_dimensions=int(
-                os.environ.get(
-                    "CLAIM_EVIDENCE_EMBED_DIMENSIONS", DEFAULT_EMBED_DIMENSIONS
-                )
+            embed_dimensions=_positive_int(
+                "CLAIM_EVIDENCE_EMBED_DIMENSIONS", DEFAULT_EMBED_DIMENSIONS
             ),
             chat_model=os.environ.get("CLAIM_EVIDENCE_CHAT_MODEL", DEFAULT_CHAT_MODEL),
             vision_model=os.environ.get(
                 "CLAIM_EVIDENCE_VISION_MODEL", DEFAULT_VISION_MODEL
             ),
-            embed_batch_size=int(
-                os.environ.get("CLAIM_EVIDENCE_EMBED_BATCH_SIZE", "32")
+            embed_batch_size=_positive_int(
+                "CLAIM_EVIDENCE_EMBED_BATCH_SIZE", 32
             ),
-            request_timeout=float(
-                os.environ.get("CLAIM_EVIDENCE_REQUEST_TIMEOUT", "600")
+            request_timeout=_positive_float("CLAIM_EVIDENCE_REQUEST_TIMEOUT", 600.0),
+            model_backend=os.environ.get("CLAIM_EVIDENCE_MODEL_BACKEND", "ollama"),
+            llamacpp_base_url=os.environ.get(
+                "CLAIM_EVIDENCE_LLAMACPP_BASE_URL", DEFAULT_LLAMACPP_BASE_URL
             ),
+            llamacpp_embed_base_url=os.environ.get(
+                "CLAIM_EVIDENCE_LLAMACPP_EMBED_BASE_URL",
+                DEFAULT_LLAMACPP_EMBED_BASE_URL,
+            ),
+            llamacpp_vision_base_url=os.environ.get(
+                "CLAIM_EVIDENCE_LLAMACPP_VISION_BASE_URL"
+            ),
+            llamacpp_api_key=os.environ.get("CLAIM_EVIDENCE_LLAMACPP_API_KEY"),
         )
 
     @property
     def index_fingerprint_parts(self) -> tuple[str, str]:
         """Model identity that invalidates an existing index when it changes."""
-        return (self.embed_model, str(self.embed_dimensions))
+        return (self.model_identifier(self.embed_model), str(self.embed_dimensions))
+
+    def model_identifier(self, model: str) -> str:
+        """Provider-qualified identity stored with vectors and audit rows."""
+        return model if self.model_backend == "ollama" else f"llamacpp:{model}"
+
+    def llamacpp_url(self, role: str) -> str:
+        if role == "embed":
+            return self.llamacpp_embed_base_url
+        if role == "vision":
+            return self.llamacpp_vision_base_url or self.llamacpp_base_url
+        return self.llamacpp_base_url
 
 
 def _positive_float(variable: str, default: float) -> float:
@@ -140,6 +208,32 @@ def _positive_int(variable: str, default: int) -> int:
         return int(raw)
     except ValueError:
         raise ValidationError(f"{variable} must be a positive integer") from None
+
+
+def _server_origin(value: str, variable: str) -> str:
+    """A server origin, not an endpoint or credential-bearing URL."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError(f"{variable} must be an absolute HTTP or HTTPS origin")
+    text = value.strip().rstrip("/")
+    try:
+        parsed = urlsplit(text)
+        parsed.port
+    except ValueError:
+        raise ValidationError(
+            f"{variable} must be an absolute HTTP or HTTPS origin"
+        ) from None
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValidationError(f"{variable} must be an absolute HTTP or HTTPS origin")
+    return text
 
 
 __all__ = [

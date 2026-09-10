@@ -11,6 +11,7 @@ a fabricated number is rejected before it can ever be cited.
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from decimal import Decimal
@@ -42,6 +43,8 @@ from .normalize import (
     unit_conversion,
     values_agree,
 )
+
+logger = logging.getLogger(__name__)
 
 Comparison = Literal["match", "conflict", "incomparable"]
 
@@ -183,9 +186,23 @@ def accept_llm_facts(
     for fact in facts:
         if not fact.quote or not contains_quote(unit.text, fact.quote):
             rejected.append(f"{unit.unit_key}: quote not in source: {fact.quote!r}")
+            logger.warning(
+                "extracted fact rejected",
+                extra={
+                    "event": "fact_rejected", "unit_key": unit.unit_key,
+                    "reason": "quote_not_in_source", "extraction_method": "llm",
+                },
+            )
             continue
         if fact.value_decimal is None and not fact.value_text:
             rejected.append(f"{unit.unit_key}: fact has no value")
+            logger.warning(
+                "extracted fact rejected",
+                extra={
+                    "event": "fact_rejected", "unit_key": unit.unit_key,
+                    "reason": "missing_value", "extraction_method": "llm",
+                },
+            )
             continue
         kept.append(
             fact.model_copy(
