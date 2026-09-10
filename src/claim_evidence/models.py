@@ -547,6 +547,8 @@ class HealthReport(PublicModel):
     driver exceptions, or prompts -- only categories and safe sentences."""
 
     database_reachable: bool = False
+    model_backend: Literal["ollama", "llamacpp"] = "ollama"
+    model_server_reachable: bool = False
     schema_version: int | None = None
     schema_current: bool = False
     pgvector_version: str | None = None

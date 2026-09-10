@@ -69,6 +69,9 @@ Pull the models into Ollama:
 ollama pull qwen3-embedding:4b
 ```
 
+Ollama remains the default model backend. A native Windows llama.cpp setup is
+described below.
+
 ## Configuration
 
 | Variable | Default |
@@ -76,7 +79,12 @@ ollama pull qwen3-embedding:4b
 | `CLAIM_EVIDENCE_DATABASE_URL` | `postgresql://claim_evidence:claim_evidence@localhost:5433/claim_evidence` |
 | `CLAIM_EVIDENCE_DATABASE_CONNECT_TIMEOUT` | `10` (seconds) |
 | `CLAIM_EVIDENCE_BUILD_STALE_MINUTES` | `60` |
+| `CLAIM_EVIDENCE_MODEL_BACKEND` | `ollama` (`ollama` or `llamacpp`) |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` |
+| `CLAIM_EVIDENCE_LLAMACPP_BASE_URL` | `http://127.0.0.1:8080` (chat) |
+| `CLAIM_EVIDENCE_LLAMACPP_EMBED_BASE_URL` | `http://127.0.0.1:8081` |
+| `CLAIM_EVIDENCE_LLAMACPP_VISION_BASE_URL` | chat URL when unset |
+| `CLAIM_EVIDENCE_LLAMACPP_API_KEY` | unset |
 | `CLAIM_EVIDENCE_EMBED_MODEL` | `qwen3-embedding:4b` |
 | `CLAIM_EVIDENCE_EMBED_DIMENSIONS` | `1024` |
 | `CLAIM_EVIDENCE_CHAT_MODEL` | `hf.co/unsloth/Qwen3-VL-4B-Instruct-GGUF:UD-Q8_K_XL` |
@@ -87,15 +95,63 @@ ollama pull qwen3-embedding:4b
 
 Point `CLAIM_EVIDENCE_DATABASE_URL` at a managed instance to skip Compose
 entirely. The embedding dimension is templated into the schema at `db init`, so
-changing the model means re-running `db init` on a fresh database.
+changing dimensions means re-running `db init` on a fresh database. Changing
+the embedding provider, model, quantization, or preprocessing while retaining
+the same dimension requires re-ingestion. Give changed llama.cpp weights a new
+server alias: llama.cpp does not expose a weight digest that this package can
+pin, and an unchanged alias cannot prove reproducibility.
 
-`CLAIM_EVIDENCE_NUM_CTX` is the context window for chat and vision requests;
-embeddings are unaffected, since `/api/embed` has no such option. Every
+`CLAIM_EVIDENCE_NUM_CTX` is the context window for chat and vision requests.
+Ollama receives it on every request; llama.cpp must be started with the same
+value and health reports a mismatch. Embeddings are unaffected. Every
 structured call this package makes is bounded — one evidence passage for fact
 extraction, at most `MAX_PASSAGES` × `PASSAGE_CHARS` for adjudication — so the
 model's 64k default buys nothing and spends KV-cache memory that would
 otherwise hold model layers on the GPU. Raise it only for prompts measured to
 need it.
+
+### llama.cpp on Windows
+
+Download a CUDA-enabled `llama-server.exe` from the official llama.cpp
+releases, then download the GGUF files separately. The initial configuration
+uses two manually managed servers: Qwen3-VL-4B-Instruct UD-Q8_K_XL plus its
+matching `mmproj-F16.gguf` for chat and vision, and Qwen3-Embedding-4B Q8_0 for
+embeddings. Replace the example paths with the real locations:
+
+```powershell
+& 'C:\path\to\llama-server.exe' -m 'C:\models\Qwen3-VL-4B-Instruct-UD-Q8_K_XL.gguf' --mmproj 'C:\models\mmproj-F16.gguf' --alias 'hf.co/unsloth/Qwen3-VL-4B-Instruct-GGUF:UD-Q8_K_XL' --host 127.0.0.1 --port 8080 -c 16384 -np 1 -ngl auto --jinja
+```
+
+```powershell
+& 'C:\path\to\llama-server.exe' -m 'C:\models\Qwen3-Embedding-4B-Q8_0.gguf' --alias 'qwen3-embedding:4b' --host 127.0.0.1 --port 8081 --embedding --pooling last -c 8192 -b 8192 -ub 8192 -ngl auto
+```
+
+Configure this package in the terminal where it runs:
+
+```powershell
+$env:CLAIM_EVIDENCE_MODEL_BACKEND = 'llamacpp'
+$env:CLAIM_EVIDENCE_LLAMACPP_BASE_URL = 'http://127.0.0.1:8080'
+$env:CLAIM_EVIDENCE_LLAMACPP_EMBED_BASE_URL = 'http://127.0.0.1:8081'
+$env:CLAIM_EVIDENCE_NUM_CTX = '16384'
+$env:CLAIM_EVIDENCE_EMBED_DIMENSIONS = '1024'
+claim-evidence health
+```
+
+For a remote deployment, set both base URLs to absolute `https://` origins,
+set the vision URL only when vision has a separate origin, and set
+`CLAIM_EVIDENCE_LLAMACPP_API_KEY` when the server requires a bearer key. URLs
+must be origins without a `/v1` suffix. TLS verification remains enabled.
+
+After health succeeds, run the read-only live smoke check with a representative
+image crop:
+
+```powershell
+python tests/smoke_llamacpp.py C:\path\to\crop.png
+```
+
+Switching backends never reuses an incompatible vector index. Re-run `ingest`
+for each source using the selected backend. Changing only the fact-generation
+model also calls for full re-ingestion rather than `retry-facts`.
 
 An unreachable database raises `DependencyUnavailableError` after
 `CLAIM_EVIDENCE_DATABASE_CONNECT_TIMEOUT` rather than blocking on the operating

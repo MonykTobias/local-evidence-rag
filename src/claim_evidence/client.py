@@ -51,7 +51,11 @@ from .models import (
     IngestReport,
     RemovalReport,
 )
-from .ollama import OllamaClient, OllamaError
+from .model_client import (
+    ModelClient,
+    ModelError,
+    require_compatible_embeddings,
+)
 from .progress import ProgressCallback
 from .retrieve import retrieve, to_matches
 
@@ -63,13 +67,13 @@ class ClaimEvidence:
         self,
         settings: Settings,
         conn: psycopg.Connection | None = None,
-        client: OllamaClient | None = None,
+        client: ModelClient | None = None,
     ) -> None:
         self.settings = settings
         self.conn = conn or connect(
             settings.database_url, settings.database_connect_timeout
         )
-        self.ollama = client or OllamaClient(settings)
+        self.ollama = client or ModelClient(settings)
 
     @classmethod
     def from_env(cls) -> "ClaimEvidence":
@@ -231,6 +235,7 @@ class ClaimEvidence:
                 raise IndexNotReadyError(
                     "no ready document version; ingest a document first"
                 )
+            require_compatible_embeddings(self.settings, rows)
             return None, [_reference(row) for row in rows]
 
         wanted: list[int] = []
@@ -257,6 +262,7 @@ class ClaimEvidence:
             raise IndexNotReadyError(
                 f"document {unready[0]} has no ready version to query"
             )
+        require_compatible_embeddings(self.settings, rows)
         return unique, [_reference(row) for row in rows]
 
     def search_evidence(
@@ -287,7 +293,7 @@ class ClaimEvidence:
         parsed = heuristic_claim(query)
         try:
             embedding = self.ollama.embed([query])[0]
-        except OllamaError as exc:
+        except ModelError as exc:
             embedding = None
             logger.warning(
                 "evidence search fell back to lexical retrieval",

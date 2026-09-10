@@ -39,7 +39,7 @@ class UnsupportedClaimError(ValidationError):
 
 
 class DependencyUnavailableError(ClaimEvidenceError):
-    """PostgreSQL, pgvector, or Ollama could not be reached or used."""
+    """PostgreSQL, pgvector, or the model server could not be reached or used."""
 
 
 class IndexNotReadyError(ClaimEvidenceError):

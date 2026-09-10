@@ -15,6 +15,7 @@ from .errors import (
     ValidationError,
 )
 from .progress import ProgressCallback
+from .model_client import ModelClient, ModelError
 from .models import (
     AuditTrace,
     Citation,
@@ -73,6 +74,8 @@ __all__ = [
     "IndexReference",
     "IngestReport",
     "ModelHealth",
+    "ModelClient",
+    "ModelError",
     "NotFoundError",
     "NumericComparison",
     "ProgressCallback",

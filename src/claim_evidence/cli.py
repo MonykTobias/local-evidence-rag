@@ -15,7 +15,7 @@ from .client import ClaimEvidence
 from .errors import ClaimEvidenceError, ValidationError
 from .ingest import IngestionError
 from .models import ClaimResult, EvidenceMatch, HealthReport, IngestReport
-from .ollama import OllamaError
+from .model_client import ModelError
 from .progress import classify_error
 from .reset import CONFIRM_PHRASE, reset_dev
 from .source import OutputValidationError
@@ -25,7 +25,7 @@ USER_ERRORS = (
     OutputValidationError,
     IngestionError,
     AuditError,
-    OllamaError,
+    ModelError,
 )
 
 
@@ -315,10 +315,15 @@ def _format_health(report: HealthReport) -> str:
         f"schema     v{report.schema_version} "
         f"({'current' if report.schema_current else 'OUT OF DATE'})",
         f"pgvector   {report.pgvector_version or 'not installed'}",
-        f"ollama     {'reachable' if report.ollama_reachable else 'UNREACHABLE'}",
+        f"{report.model_backend:<11}"
+        f"{'reachable' if report.model_server_reachable else 'UNREACHABLE'}",
     ]
     for model in report.models:
-        state = "available" if model.available else "NOT PULLED"
+        state = (
+            "available"
+            if model.available
+            else "NOT PULLED" if report.model_backend == "ollama" else "UNAVAILABLE"
+        )
         lines.append(f"  {model.role:<7}{model.name} [{state}]")
     lines += [
         f"documents  {report.documents_ready} ready, "
@@ -380,7 +385,7 @@ def cli() -> None:
     """Run one command, reporting failures the way a public surface must.
 
     Every failure is classified before it is printed. Only the package's own
-    typed errors carry a message written for a person; an Ollama error embeds
+    typed errors carry a message written for a person; a model error can embed
     the model's reply, a driver error embeds the host and sometimes the
     password, and an unexpected bug embeds whatever it happened to be holding.
     Those are reported by category.

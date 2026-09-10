@@ -174,6 +174,28 @@ def test_the_embedding_configuration_changes_it() -> None:
         )
 
 
+def test_the_model_backend_changes_it_but_its_url_does_not() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        root = build_root(Path(temp) / "run")
+        ollama = fingerprint_of(root)
+        first = settings(
+            model_backend="llamacpp",
+            llamacpp_base_url="http://127.0.0.1:8080",
+            llamacpp_embed_base_url="http://127.0.0.1:8081",
+        )
+        second = settings(
+            model_backend="llamacpp",
+            llamacpp_base_url="https://remote.example.test:8443",
+            llamacpp_embed_base_url="https://remote.example.test:8444",
+            llamacpp_api_key="secret",
+        )
+        check(fingerprint_of(root, config=first) != ollama, "the provider invalidates the build")
+        check(
+            fingerprint_of(root, config=first) == fingerprint_of(root, config=second),
+            "llama.cpp URLs and credentials do not invalidate the build",
+        )
+
+
 def test_the_reporting_entity_changes_it() -> None:
     """Every stored fact is attributed to it, so it decides what gets stored."""
     with tempfile.TemporaryDirectory() as temp:

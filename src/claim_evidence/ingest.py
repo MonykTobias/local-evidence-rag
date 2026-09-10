@@ -68,7 +68,11 @@ from .errors import (
     NotFoundError,
     ValidationError,
 )
-from .ollama import OllamaClient, OllamaError
+from .model_client import (
+    ModelClient,
+    ModelError,
+    require_compatible_embeddings,
+)
 from .source import OutputReader, canonical_digest, page_units, sha256_file
 
 logger = logging.getLogger(__name__)
@@ -244,7 +248,7 @@ def index_fingerprint(
 def build_fingerprint(
     reader: OutputReader,
     settings: Settings,
-    client: OllamaClient,
+    client: ModelClient,
     *,
     source_sha256: str | None,
     reporting_entity: str,
@@ -277,7 +281,7 @@ def build_fingerprint(
 
 def ingest_document(
     conn: psycopg.Connection,
-    client: OllamaClient,
+    client: ModelClient,
     settings: Settings,
     output_root: str | Path,
     *,
@@ -355,7 +359,7 @@ def _record_failure(
 
 def _ingest(
     conn: psycopg.Connection,
-    client: OllamaClient,
+    client: ModelClient,
     settings: Settings,
     output_root: str | Path,
     *,
@@ -456,7 +460,7 @@ def _ingest(
         conn,
         document_id,
         fingerprint,
-        embed_model=settings.embed_model,
+        embed_model=settings.model_identifier(settings.embed_model),
         embed_dim=settings.embed_dimensions,
         output_root=str(reader.root),
         source_pdf=str(source_pdf_path) if source_pdf_path else None,
@@ -662,7 +666,7 @@ def _stored_counts(conn: psycopg.Connection, version_id: int) -> dict[str, int]:
 
 def _embed_pending(
     conn: psycopg.Connection,
-    client: OllamaClient,
+    client: ModelClient,
     settings: Settings,
     version_id: int,
     reporter: ProgressReporter,
@@ -719,7 +723,7 @@ def _embed_pending(
 
 def _build_facts(
     conn: psycopg.Connection,
-    client: OllamaClient,
+    client: ModelClient,
     version_id: int,
     subject: str,
     subject_entity: int,
@@ -789,7 +793,7 @@ def _build_facts(
                 FACT_EXTRACTION_SYSTEM,
                 fact_extraction_prompt(unit, subject),
             )
-        except OllamaError as exc:
+        except ModelError as exc:
             # One passage the model could not process is not a failed index --
             # but it is not a silent success either. The key and a category are
             # recorded so a retry can process exactly this candidate again; the
@@ -1048,7 +1052,7 @@ def _verify(
 
 def retry_failed_facts(
     conn: psycopg.Connection,
-    client: OllamaClient,
+    client: ModelClient,
     settings: Settings,
     version_id: int,
     *,
@@ -1070,6 +1074,7 @@ def retry_failed_facts(
     ).fetchone()
     if version is None:
         raise NotFoundError(f"no document version with id {version_id}")
+    require_compatible_embeddings(settings, [version])
     reporter.document_id = int(version["document_id"])
     logger.info(
         "fact retry started",
@@ -1113,7 +1118,7 @@ def retry_failed_facts(
                 FACT_EXTRACTION_SYSTEM,
                 fact_extraction_prompt(candidate, subject),
             )
-        except OllamaError as exc:
+        except ModelError as exc:
             record_fact_failure(
                 conn, version_id, row["unit_key"], "model_unavailable"
             )

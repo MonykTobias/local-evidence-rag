@@ -28,7 +28,7 @@ from PIL import Image
 
 from .models import Region, VisualResult, VisualVerification
 from .normalize import contains_quote, normalize_for_match, normalize_unit
-from .ollama import OllamaClient, OllamaError
+from .model_client import ModelClient, ModelError
 
 VISION_SYSTEM = """\
 You inspect one cropped region of a report page.
@@ -90,7 +90,7 @@ def crop_region(page_png: Path, regions: Sequence[Region]) -> bytes:
 
 
 def verify_visual(
-    client: OllamaClient,
+    client: ModelClient,
     page_png: Path,
     regions: Sequence[Region],
     claim: str,
@@ -122,7 +122,7 @@ def verify_visual(
             f"<claim>{claim}</claim>\n\nWhat does this crop show?",
             image,
         )
-    except OllamaError:
+    except ModelError:
         return VisualVerification(
             result=VisualResult.ILLEGIBLE, reason_code="vision_unavailable"
         )

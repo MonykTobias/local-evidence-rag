@@ -48,9 +48,9 @@ def classify_error(exc: BaseException) -> tuple[str, bool, str]:
     one, an unexpected bug -- is reported by category, because those messages
     carry hosts, credentials, prompts, and source text.
     """
-    from .ollama import OllamaError
+    from .model_client import ModelError
 
-    if isinstance(exc, OllamaError):
+    if isinstance(exc, ModelError):
         # Deliberately not str(exc): it embeds the model's response body to
         # make server-side debugging possible.
         return "dependency_unavailable", True, DEPENDENCY_ERROR_MESSAGE

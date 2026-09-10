@@ -56,6 +56,19 @@ class FakeSession:
                 if override is not None:
                     return FakeResponse({"embeddings": override})
             return FakeResponse({"embeddings": [self.vector(t) for t in inputs]})
+        if url.endswith("/v1/embeddings"):
+            inputs = payload["input"]
+            vectors = self.embed_hook(inputs) if self.embed_hook is not None else None
+            if vectors is None:
+                vectors = [self.vector(text) for text in inputs]
+            return FakeResponse(
+                {
+                    "data": [
+                        {"index": index, "embedding": vector}
+                        for index, vector in enumerate(vectors)
+                    ]
+                }
+            )
         if url.endswith("/api/show"):
             digest = self.model_digests.get(payload.get("model", ""))
             return FakeResponse({"digest": digest} if digest else {})
@@ -67,6 +80,18 @@ class FakeSession:
             if not self.chat_replies:
                 raise AssertionError(f"unexpected chat call for schema {title}")
             return FakeResponse({"message": {"content": self.chat_replies.pop(0)}})
+        if url.endswith("/v1/chat/completions"):
+            title = ((payload.get("response_format") or {}).get("schema") or {}).get(
+                "title"
+            )
+            handler = self.chat_router.get(title)
+            if handler is not None:
+                content = reply(handler(payload))
+            elif self.chat_replies:
+                content = self.chat_replies.pop(0)
+            else:
+                raise AssertionError(f"unexpected chat call for schema {title}")
+            return FakeResponse({"choices": [{"message": {"content": content}}]})
         raise AssertionError(f"unexpected url {url}")
 
     def get(self, url: str, timeout: float) -> FakeResponse:
